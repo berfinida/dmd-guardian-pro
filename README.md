@@ -1,111 +1,97 @@
-🧠 NIZEN | Neurodegenerative Clinical Platform
+# NIZEN Clinical Platform (`final_v50.py`)
 
-NIZEN is a modular clinical monitoring platform designed for neurodegenerative diseases.
+Streamlit tabanlı, çok hastalıklı (DMD + nörodejeneratif workspaceler) klinik karar-destek ve takip uygulaması.
 
-The current implementation focuses on Duchenne Muscular Dystrophy (DMD), with a scalable architecture planned to support additional conditions in future versions.
+## Kapsam
 
-Built with Streamlit, SQLite, and Google Sheets integration, NIZEN operates in a hybrid local + cloud environment.
+- DMD ana modülleri: dashboard, klinik hesaplayıcı, NSAA, acil durum, takvim/haklar, SSS, haberler, AI destekli soru-cevap.
+- Nöro workspace modları: ALS, Alzheimer, Parkinson, Huntington, Lewy Body Demans, FTD, SMA.
+- Rol tabanlı erişim: `family`, `doctor`, `researcher`, `admin`.
+- Yerel kalıcılık: SQLite (`data/dmd_local.db`) + JSON kuyruk/yedek dosyaları.
+- Opsiyonel bulut senkron: Google Sheets (`streamlit-gsheets`).
+- Opsiyonel AI entegrasyonu: OpenAI Responses API.
 
-🎯 Vision
+## Proje Yapısı
 
-NIZEN aims to become a unified clinical tracking and collaboration platform for:
+- Uygulama: `final_v50.py`
+- Test: `tests/test_dmd_exon_phase_map.py`
+- Veri klasörü (runtime): `data/`
 
-Duchenne Muscular Dystrophy (DMD)
+## Gereksinimler
 
-ALS (planned)
+Minimum:
 
-SMA (planned)
+- Python 3.10+
+- `streamlit`
+- `pandas`
 
-Other neurodegenerative disorders (future expansion)
+Opsiyonel:
 
-The system is designed to be disease-modular and extensible.
+- `streamlit-gsheets` (Google Sheets senkronu)
+- `bcrypt` (şifre hash için)
+- `plotly` (grafikler)
+- `reportlab` (PDF rapor)
 
-🚀 Current Module: DMD
-🔐 Secure Authentication
+## Çalıştırma
 
-Role-based access (Family / Doctor / Researcher / Admin)
-
-Password hashing (bcrypt / fallback support)
-
-Persistent session tokens
-
-Admin bootstrap support
-
-📊 Clinical Tracking
-
-NSAA score monitoring
-
-Weight & age tracking
-
-Historical data logging
-
-Timestamp-based conflict resolution
-
-☁️ Hybrid Architecture
-
-Local-first SQLite storage
-
-Google Sheets cloud sync
-
-Offline-safe sync queue
-
-Automatic health checks
-
-🤖 Optional AI Assistant
-
-OpenAI API integration
-
-Safe medical-response prompting
-
-Escalation guidance for emergencies
-
-📰 Research & News Feed
-
-DMD-related RSS integration
-
-Language filtering (TR / EN)
-
-🏗️ Tech Stack
-
-Python
-
-Streamlit
-
-SQLite
-
-Pandas
-
-streamlit-gsheets
-
-bcrypt
-
-ReportLab
-
-📂 Project Structure
-final_v50.py
-/data
-   ├── dmd_local.db
-   ├── dmd_users.json
-   ├── dmd_profiles.json
-   ├── sync_queue.json
-   └── uploads/
-⚙️ Installation
-pip install -r requirements.txt
+```powershell
 streamlit run final_v50.py
-🔮 Roadmap
+```
 
-Multi-disease module architecture
+## Konfigürasyon
 
-Advanced analytics dashboard
+### 1) `st.secrets` / environment
 
-Clinical report generation
+Desteklenen ana ayarlar:
 
-Research-mode data export
+- `SHEET_URL` veya env `SHEET_URL`
+- `OPENAI_API_KEY` veya env `OPENAI_API_KEY`
+- `auth_secret` veya env `AUTH_SECRET`
+- `persistent_login_via_query` veya env `DMD_PERSISTENT_LOGIN_QUERY`
+- env `DMD_PERSISTENT_LOGIN_TTL_SEC`
+- `i18n_patch_enabled` veya env `DMD_ENABLE_ST_I18N_PATCH`
+- `admin_owner_username`, `admin_owner_password_hash` (veya `admin_owner_password`)
+- env: `DMD_ADMIN_OWNER_USERNAME`, `DMD_ADMIN_OWNER_PASSWORD_HASH`, `DMD_ADMIN_OWNER_PASSWORD`
+- `user_roles` veya env `DMD_USER_ROLES_JSON`
+- `research_salt` (anonim araştırma exportu için gerekli)
+- env `DMD_DEBUG`
 
-Secure multi-center deployment
+### 2) Örnek `.streamlit/secrets.toml`
 
-Regulatory compliance pathway
+```toml
+SHEET_URL = "https://docs.google.com/spreadsheets/d/<ID>"
+OPENAI_API_KEY = "sk-..."
+auth_secret = "<32+ byte entropy secret>"
+persistent_login_via_query = true
+i18n_patch_enabled = true
+research_salt = "change-me"
 
-⚠️ Disclaimer
+[user_roles]
+demo_doctor = "doctor"
+demo_research = "researcher"
+```
 
-NIZEN is currently a research-oriented prototype and is not intended for certified medical deployment without regulatory approval.
+## Kimlik Doğrulama ve Güvenlik
+
+- Şifreler `bcrypt` (varsa) veya `PBKDF2-HMAC-SHA256` ile saklanır.
+- Legacy şifre formatlarından yeni hash formatına otomatik migrasyon vardır.
+- Geçici hesap kilitleme (başarısız deneme sayacı) bulunur.
+- Kalıcı giriş (query token) HMAC imzalıdır; güçlü `auth_secret` gerektirir.
+
+## Veri Katmanı
+
+- Yerel DB tabloları: `users`, `profiles`, `system_kv`
+- Legacy JSON dosyalarından DB’ye tek seferlik migrasyon yapılır.
+- Bulut yazımı başarısız olursa sync queue’ya alınır ve sonra drain edilir.
+
+## Test ve Doğrulama
+
+```powershell
+python -B -m py_compile final_v50.py
+python -m unittest tests/test_dmd_exon_phase_map.py -v
+```
+
+## Notlar
+
+- `git` bulunmayan ortamlarda uygulama yine çalışır; sürüm kontrolü için ayrıca kurulmalıdır.
+- Google Sheets için servis hesabı paylaşım izinleri ve worksheet adları (`users`, `profiles`) doğru olmalıdır.
