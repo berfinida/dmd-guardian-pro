@@ -1,5 +1,9 @@
-streamlit
-pandas
-streamlit-gsheets
-bcrypt
-reportlab
+# Core
+streamlit>=1.32
+pandas>=2.0
+
+# Optional but used by app features
+plotly>=5.0
+reportlab>=4.0
+streamlit-gsheets>=0.0.10
+bcrypt>=4.0
