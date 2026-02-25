@@ -9,6 +9,7 @@ import html
 import io
 import csv
 import sqlite3
+import importlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.request import Request, urlopen
@@ -17,10 +18,22 @@ from urllib.parse import quote_plus
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, timezone
-
+px = None
 try:
-    from reportlab.lib.pagesizes import A4
-    from reportlab.pdfgen import canvas
+    # Optional dependency: load dynamically to avoid static analyzer missing-import warnings.
+    px = importlib.import_module("plotly.express")
+    PLOTLY_OK = True
+except Exception:
+    PLOTLY_OK = False
+
+A4 = (595.2755905511812, 841.8897637795277)  # fallback A4 size in points
+canvas = None
+try:
+    # Optional dependency: load dynamically to avoid static analyzer missing-source warnings.
+    _reportlab_pagesizes = importlib.import_module("reportlab.lib.pagesizes")
+    _reportlab_canvas = importlib.import_module("reportlab.pdfgen.canvas")
+    A4 = _reportlab_pagesizes.A4
+    canvas = _reportlab_canvas
     REPORTLAB_OK = True
 except Exception:
     REPORTLAB_OK = False
@@ -33,7 +46,8 @@ except Exception:
     GSheetsConnection = None  # streamlit-gsheets not installed or misconfigured
 
 try:
-    import bcrypt
+    # Optional dependency: load dynamically so static analyzers don't flag missing import.
+    bcrypt = importlib.import_module("bcrypt")
     BCRYPT_OK = True
 except Exception:
     bcrypt = None
@@ -64,7 +78,7 @@ def _debug_log(message: str, exc: Exception | None = None) -> None:
 # --- 1. SAYFA YAPILANDIRMASI & KURUMSAL KİMLİK ---
 st.set_page_config(
     page_title="NIZEN | Neurodegenerative Clinical Platform",
-    page_icon="🧠",
+    page_icon="N",
     layout="wide",
     initial_sidebar_state="expanded",
     menu_items={
@@ -291,7 +305,7 @@ def _db_connect() -> sqlite3.Connection | None:
         conn = sqlite3.connect(str(LOCAL_DB), timeout=8)
         conn.execute("PRAGMA foreign_keys = ON")
         return conn
-    except Exception:
+    except (OSError, sqlite3.Error):
         return None
 
 
@@ -328,7 +342,7 @@ def _init_local_db() -> None:
             """
         )
         conn.commit()
-    except Exception as e:
+    except sqlite3.Error as e:
         _debug_log("Local DB init failed", e)
     finally:
         conn.close()
@@ -346,7 +360,7 @@ def _db_get_kv(key: str) -> str:
         if not row:
             return ""
         return str(row[0] or "")
-    except Exception:
+    except sqlite3.Error:
         return ""
     finally:
         conn.close()
@@ -373,7 +387,7 @@ def _db_set_kv(key: str, value: str) -> bool:
         )
         conn.commit()
         return True
-    except Exception:
+    except sqlite3.Error:
         return False
     finally:
         conn.close()
@@ -384,7 +398,7 @@ def _read_json_file(path: Path, default):
         if path.exists():
             with path.open("r", encoding="utf-8") as f:
                 return json.load(f)
-    except Exception as e:
+    except (OSError, json.JSONDecodeError, ValueError, TypeError) as e:
         _debug_log(f"JSON read failed: {path}", e)
     return default
 
@@ -395,7 +409,7 @@ def _write_json_file(path: Path, data) -> bool:
         with path.open("w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
         return True
-    except Exception as e:
+    except (OSError, TypeError, ValueError) as e:
         _debug_log(f"JSON write failed: {path}", e)
         return False
 
@@ -409,7 +423,7 @@ def _load_local_user_roles() -> dict[str, str]:
             parsed = json.loads(db_blob)
             if isinstance(parsed, dict):
                 raw_db = parsed
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         raw_db = {}
     if isinstance(raw_db, dict) and raw_db:
         raw = {**(raw if isinstance(raw, dict) else {}), **raw_db}
@@ -434,7 +448,7 @@ def _save_local_user_roles(role_map: dict[str, str]) -> None:
     _write_json_file(LOCAL_USER_ROLES_STORE, safe)
     try:
         _db_set_kv("user_roles_json", json.dumps(safe, ensure_ascii=False))
-    except Exception:
+    except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
 
@@ -668,7 +682,7 @@ def _migrate_legacy_json_to_db_once() -> None:
                         (user, json.dumps(safe_payload, ensure_ascii=False)),
                     )
         conn.commit()
-    except Exception as e:
+    except sqlite3.Error as e:
         _debug_log("Legacy JSON->DB migration failed", e)
     finally:
         conn.close()
@@ -908,6 +922,51 @@ def fetch_dmd_news(lang: str = "TR", limit: int = 20) -> list[dict]:
     return deduped
 
 
+@st.cache_data(ttl=600)
+def fetch_disease_news(query: str, lang: str = "TR", limit: int = 20) -> list[dict]:
+    q = str(query or "").strip() or "neurodegenerative disease"
+    rss_url = (
+        "https://news.google.com/rss/search?q="
+        + quote_plus(q)
+        + ("&hl=en-US&gl=US&ceid=US:en" if lang == "EN" else "&hl=tr&gl=TR&ceid=TR:tr")
+    )
+    req = Request(rss_url, headers={"User-Agent": "Mozilla/5.0"})
+    items: list[dict] = []
+    try:
+        with urlopen(req, timeout=12) as resp:
+            xml_data = resp.read()
+        root = ET.fromstring(xml_data)
+        for item in root.findall(".//item"):
+            title = (item.findtext("title") or "").strip()
+            link = (item.findtext("link") or "").strip()
+            source_el = item.find("source")
+            source = (source_el.text or "").strip() if source_el is not None else "Google News"
+            pub_raw = (item.findtext("pubDate") or "").strip()
+            published = ""
+            if pub_raw:
+                try:
+                    dt = parsedate_to_datetime(pub_raw)
+                    published = dt.strftime("%Y-%m-%d %H:%M")
+                except Exception:
+                    published = pub_raw
+            if title and link:
+                items.append({"title": title, "link": link, "source": source, "published": published})
+            if len(items) >= limit:
+                break
+    except Exception:
+        return []
+
+    seen = set()
+    out = []
+    for it in items:
+        key = (it["title"], it["link"])
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(it)
+    return out
+
+
 def _get_openai_api_key() -> str:
     runtime_key = str(st.session_state.get("openai_api_key", "")).strip()
     if runtime_key:
@@ -919,6 +978,29 @@ def _get_openai_api_key() -> str:
     if not key:
         key = os.getenv("OPENAI_API_KEY", "")
     return str(key).strip()
+
+
+def _render_ai_key_settings(scope_key: str = "global") -> bool:
+    if "openai_api_key" not in st.session_state:
+        st.session_state["openai_api_key"] = ""
+    with st.expander("AI Ayarları"):
+        runtime_key_input = st.text_input(
+            "OpenAI API Key",
+            value=st.session_state.get("openai_api_key", ""),
+            type="password",
+            placeholder="sk-...",
+            key=f"openai_api_key_input::{scope_key}",
+            help="Boş bırakırsan önce st.secrets, sonra ortam değişkeni kullanılır.",
+        )
+        st.session_state["openai_api_key"] = (runtime_key_input or "").strip()
+        has_key = bool(_get_openai_api_key())
+        st.caption(f"API anahtar durumu: {'Hazır' if has_key else 'Tanımlı değil'}")
+        if st.button("AI anahtarını temizle", key=f"clear_openai_api_key::{scope_key}", use_container_width=True):
+            st.session_state["openai_api_key"] = ""
+            st.rerun()
+        if not has_key:
+            st.warning("AI için API anahtarı tanımlı değil. Ayarlardan anahtar girin.")
+    return bool(_get_openai_api_key())
 
 
 def ask_openai_medical_assistant(question: str, context_text: str = "") -> str:
@@ -1206,11 +1288,11 @@ def load_all_profiles() -> dict:
                 continue
             try:
                 payload = json.loads(str(payload_raw or "{}"))
-            except Exception:
+            except (json.JSONDecodeError, TypeError, ValueError):
                 payload = {}
             out[user] = payload if isinstance(payload, dict) else {}
         return out
-    except Exception:
+    except sqlite3.Error:
         return {}
     finally:
         conn.close()
@@ -1233,7 +1315,7 @@ def load_local_profile(username: str) -> dict:
         payload_raw = str(row[0] or "{}")
         payload = json.loads(payload_raw)
         return payload if isinstance(payload, dict) else {}
-    except Exception:
+    except (sqlite3.Error, json.JSONDecodeError, TypeError, ValueError):
         return {}
     finally:
         conn.close()
@@ -1283,7 +1365,7 @@ def save_user_profile(username: str, payload: dict) -> None:
                 (username, json.dumps(safe_payload, ensure_ascii=False)),
             )
             conn.commit()
-        except Exception as e:
+        except sqlite3.Error as e:
             _debug_log("Local profile save failed", e)
         finally:
             conn.close()
@@ -2007,6 +2089,10 @@ def _ensure_core_state() -> None:
         st.session_state["visits"] = []
     if "documents" not in st.session_state or not isinstance(st.session_state.get("documents"), list):
         st.session_state["documents"] = []
+    if "neuro_dynamic_records" not in st.session_state or not isinstance(st.session_state.get("neuro_dynamic_records"), dict):
+        st.session_state["neuro_dynamic_records"] = {}
+    if "neuro_workspace_notes" not in st.session_state or not isinstance(st.session_state.get("neuro_workspace_notes"), dict):
+        st.session_state["neuro_workspace_notes"] = {}
 
 
 # --- NEW/UPDATED --- Role-based default session timeout policy
@@ -2613,6 +2699,8 @@ def save_current_session_profile() -> None:
         "user_role": st.session_state.get("user_role", "family"),
         "privacy_settings": st.session_state.get("privacy_settings", {}),
         "notification_ack": st.session_state.get("notification_ack", {}),
+        "neuro_dynamic_records": st.session_state.get("neuro_dynamic_records", {}),
+        "neuro_workspace_notes": st.session_state.get("neuro_workspace_notes", {}),
         "updated_at": _now_iso(),
     }
     # Gereksiz sık kaydı engelle: değişmediyse veya çok kısa aralıksa yazma.
@@ -2861,15 +2949,6 @@ if not st.session_state.logged_in:
 
     st.stop()
 
-# Logged-in kullanıcılar için güvenli otomatik kalıcılık.
-# save_current_session_profile içinde imza+zaman eşiği olduğu için gereksiz yazım baskılanır.
-if st.session_state.get("logged_in") and st.session_state.get("current_user"):
-    try:
-        _sync_session_to_active_patient()
-        save_current_session_profile()
-    except Exception as e:
-        _debug_log("auto persist failed", e)
-
 # --- 5. ANA UYGULAMA (CORE ARCHITECTURE) ---
 
 # Giriş kutlaması (sade geçiş)
@@ -2921,6 +3000,8 @@ if active_user and st.session_state.get("profile_loaded_for") != active_user:
         st.session_state["documents"] = profile.get("documents", st.session_state.get("documents", []))
         st.session_state["privacy_settings"] = profile.get("privacy_settings", st.session_state.get("privacy_settings", {}))
         st.session_state["notification_ack"] = profile.get("notification_ack", st.session_state.get("notification_ack", {}))
+        st.session_state["neuro_dynamic_records"] = profile.get("neuro_dynamic_records", st.session_state.get("neuro_dynamic_records", {}))
+        st.session_state["neuro_workspace_notes"] = profile.get("neuro_workspace_notes", st.session_state.get("neuro_workspace_notes", {}))
     # Profil yuklendikten sonra role gore timeout politikasini yeniden uygula.
     _apply_session_timeout_policy(force=True)
     st.session_state.profile_loaded_for = active_user
@@ -2943,7 +3024,10 @@ if "notification_ack" not in st.session_state or not isinstance(st.session_state
 # Otomatik kalici kayit: girisli kullanicinin son durumunu her rerun'da persist et.
 # save_current_session_profile zaten degisim imzasi + zaman esigi ile gereksiz yazimi engeller.
 if st.session_state.get("logged_in") and st.session_state.get("current_user"):
-    save_current_session_profile()
+    if st.session_state.get("_suppress_autosave_once", False):
+        st.session_state["_suppress_autosave_once"] = False
+    else:
+        save_current_session_profile()
 
 # --- DINAMIK DIL SOZLUGU (EXPANDED + SAFE) ---
 LANG = {
@@ -3227,6 +3311,57 @@ EXTRA_I18N_REPLACE = {
     },
 }
 
+WORKSPACE_I18N_REPLACE = {
+    "EN": {
+        "Klinik Vizyon": "Clinical Vision",
+        "Stratejik Odaklar": "Strategic Focus Areas",
+        "2026 Hedef Metrikleri": "2026 Target Metrics",
+        "Hedef:": "Target:",
+        "Durum:": "Status:",
+        "Klinik Yük": "Clinical Burden",
+        "Test Toplam": "Total Test Score",
+        "Test Modeli": "Test Model",
+        "Takip aralığını bireyselleştir (risk parametrelerine göre)": "Personalize follow-up interval (based on risk parameters)",
+        "Önerilen bir sonraki kontrol:": "Recommended next follow-up:",
+        "içinde.": "within.",
+        "Bu hastalık için tam ölçekli test modeli tanımlı değil.": "No full-scale test model is defined for this disease.",
+        "Bu hastalık için hedef metrik seti tanımlı değil.": "No target metric set is defined for this disease.",
+        "Bu bölümdeki skorlar izlem amaçlıdır; tanı ve tedavi kararı tek başına bu testten verilmez.": "Scores in this section are for follow-up support; diagnosis and treatment decisions must not rely on this test alone.",
+        "Vizyon sayfası ürün yönü ve klinik kalite hedeflerini özetler; tanı/tedavi kararı yerine geçmez.": "The vision page summarizes product direction and clinical quality goals; it does not replace diagnosis/treatment decisions.",
+        "Hedefe Uygun": "On Target",
+        "Dikkat": "Caution",
+        "Kritik": "Critical",
+        "Bilgi yok": "No data",
+        "Acil Uyarı": "Emergency Notice",
+        "Tam Ölçekli Test": "Full-Scale Test",
+        "Tam ölçekli test kaydedildi.": "Full-scale test saved.",
+    },
+    "DE": {
+        "Klinik Vizyon": "Klinische Vision",
+        "Stratejik Odaklar": "Strategische Schwerpunkte",
+        "2026 Hedef Metrikleri": "Zielmetriken 2026",
+        "Hedef:": "Ziel:",
+        "Durum:": "Status:",
+        "Klinik Yük": "Klinische Belastung",
+        "Test Toplam": "Gesamttestwert",
+        "Test Modeli": "Testmodell",
+        "Takip aralığını bireyselleştir (risk parametrelerine göre)": "Kontrollintervall personalisieren (nach Risikoparametern)",
+        "Önerilen bir sonraki kontrol:": "Empfohlene nächste Kontrolle:",
+        "içinde.": "innerhalb von.",
+        "Bu hastalık için tam ölçekli test modeli tanımlı değil.": "Für diese Erkrankung ist kein Volltest-Modell definiert.",
+        "Bu hastalık için hedef metrik seti tanımlı değil.": "Für diese Erkrankung ist kein Zielmetriksatz definiert.",
+        "Bu bölümdeki skorlar izlem amaçlıdır; tanı ve tedavi kararı tek başına bu testten verilmez.": "Die Werte in diesem Abschnitt dienen der Verlaufskontrolle; Diagnose- und Therapieentscheidungen dürfen nicht allein darauf basieren.",
+        "Vizyon sayfası ürün yönü ve klinik kalite hedeflerini özetler; tanı/tedavi kararı yerine geçmez.": "Die Visionsseite fasst Produktausrichtung und klinische Qualitätsziele zusammen; sie ersetzt keine Diagnose-/Therapieentscheidung.",
+        "Hedefe Uygun": "Ziel erreicht",
+        "Dikkat": "Achtung",
+        "Kritik": "Kritisch",
+        "Bilgi yok": "Keine Daten",
+        "Acil Uyarı": "Notfallhinweis",
+        "Tam Ölçekli Test": "Vollständiger Test",
+        "Tam ölçekli test kaydedildi.": "Vollständiger Test gespeichert.",
+    },
+}
+
 _I18N_NORMALIZED_MAPS: dict[str, dict[str, str]] = {}
 
 
@@ -3253,19 +3388,19 @@ def _normalize_mojibake_text(text: str) -> str:
         ("-", "-"),
         ("©", "©"),
         ("", ""),
-        ("🧠", "🧠"),
-        ("✅", "✅"),
-        ("⚠️", "⚠️"),
-        ("❤️", "❤️"),
-        ("⬇️", "⬇️"),
-        ("⬆️", "⬆️"),
-        ("➡️", "➡️"),
-        ("🫁", "🫁"),
-        ("🙌", "🙌"),
-        ("🌍", "🌍"),
-        ("⚡", "⚡"),
-        ("🧬", "🧬"),
-        ("🚀", "🚀"),
+        ("", ""),
+        ("", ""),
+        ("", ""),
+        ("", ""),
+        ("⬇", "⬇"),
+        ("⬆", "⬆"),
+        ("", ""),
+        ("", ""),
+        ("", ""),
+        ("", ""),
+        ("", ""),
+        ("", ""),
+        ("", ""),
         ("ℹ", "ℹ"),
     )
     for src, tgt in replacements:
@@ -3280,6 +3415,7 @@ def _get_i18n_map(lang: str) -> dict[str, str]:
     raw = {}
     raw.update(I18N_REPLACE.get(lang, {}))
     raw.update(EXTRA_I18N_REPLACE.get(lang, {}))
+    raw.update(WORKSPACE_I18N_REPLACE.get(lang, {}))
     norm = {}
     for k, v in raw.items():
         kk = _normalize_mojibake_text(str(k))
@@ -3727,7 +3863,2413 @@ def _delete_current_user_profile_data() -> bool:
     st.session_state["doctor_notes"] = []
     st.session_state["visits"] = []
     st.session_state["documents"] = []
+    st.session_state["neuro_dynamic_records"] = {}
+    st.session_state["neuro_workspace_notes"] = {}
+    st.session_state["profile_loaded_for"] = None
+    st.session_state["_last_profile_sig"] = ""
+    st.session_state["_last_profile_save_ts"] = 0.0
+    # Bu turda autosave'in silinen profili geri yazmasını engelle.
+    st.session_state["_suppress_autosave_once"] = True
     return ok_local
+
+
+WORKSPACE_DMD = "DMD (Duchenne Musküler Distrofi)"
+WORKSPACE_ALS = "ALS (Amyotrofik Lateral Skleroz)"
+WORKSPACE_ALZHEIMER = "Alzheimer Hastalığı"
+WORKSPACE_PARKINSON = "Parkinson Hastalığı"
+WORKSPACE_HUNTINGTON = "Huntington Hastalığı"
+WORKSPACE_LEWY = "Lewy Cisimcikli Demans"
+WORKSPACE_FTD = "Frontotemporal Demans (FTD)"
+WORKSPACE_SMA = "Spinal Müsküler Atrofi (SMA)"
+
+WORKSPACE_OPTIONS = [
+    WORKSPACE_DMD,
+    WORKSPACE_ALS,
+    WORKSPACE_ALZHEIMER,
+    WORKSPACE_PARKINSON,
+    WORKSPACE_HUNTINGTON,
+    WORKSPACE_LEWY,
+    WORKSPACE_FTD,
+    WORKSPACE_SMA,
+]
+
+# Ortak nörodejeneratif veri kolonları (DMD disi moduller icin hazir sema)
+NEURO_COMMON_DATA_COLUMNS = [
+    "patient_id",
+    "visit_date",
+    "age",
+    "sex",
+    "onset_age",
+    "disease_duration_years",
+    "functional_score",
+    "cognitive_score",
+    "motor_score",
+    "respiratory_score",
+    "notes",
+    "updated_at",
+]
+NEURO_DISEASE_DATA_SCHEMA = {
+    WORKSPACE_ALS: list(NEURO_COMMON_DATA_COLUMNS),
+    WORKSPACE_ALZHEIMER: list(NEURO_COMMON_DATA_COLUMNS),
+    WORKSPACE_PARKINSON: list(NEURO_COMMON_DATA_COLUMNS),
+    WORKSPACE_HUNTINGTON: list(NEURO_COMMON_DATA_COLUMNS),
+    WORKSPACE_LEWY: list(NEURO_COMMON_DATA_COLUMNS),
+    WORKSPACE_FTD: list(NEURO_COMMON_DATA_COLUMNS),
+    WORKSPACE_SMA: list(NEURO_COMMON_DATA_COLUMNS),
+}
+
+# Leiden uyumlu DMD exon faz haritasi (Dp427, exon 1..79)
+# Her exon icin start/end fazlari (0,1,2) tutulur.
+LEIDEN_DMD_EXON_PHASES: dict[int, dict[str, int]] = {
+    1: {"start": 0, "end": 1}, 2: {"start": 1, "end": 0}, 3: {"start": 0, "end": 0},
+    4: {"start": 0, "end": 0}, 5: {"start": 0, "end": 0}, 6: {"start": 0, "end": 2},
+    7: {"start": 2, "end": 1}, 8: {"start": 1, "end": 0}, 9: {"start": 0, "end": 0},
+    10: {"start": 0, "end": 0}, 11: {"start": 0, "end": 2}, 12: {"start": 2, "end": 0},
+    13: {"start": 0, "end": 0}, 14: {"start": 0, "end": 0}, 15: {"start": 0, "end": 0},
+    16: {"start": 0, "end": 0}, 17: {"start": 0, "end": 2}, 18: {"start": 2, "end": 0},
+    19: {"start": 0, "end": 1}, 20: {"start": 1, "end": 0}, 21: {"start": 0, "end": 1},
+    22: {"start": 1, "end": 0}, 23: {"start": 0, "end": 0}, 24: {"start": 0, "end": 0},
+    25: {"start": 0, "end": 0}, 26: {"start": 0, "end": 0}, 27: {"start": 0, "end": 0},
+    28: {"start": 0, "end": 0}, 29: {"start": 0, "end": 0}, 30: {"start": 0, "end": 0},
+    31: {"start": 0, "end": 0}, 32: {"start": 0, "end": 0}, 33: {"start": 0, "end": 0},
+    34: {"start": 0, "end": 0}, 35: {"start": 0, "end": 0}, 36: {"start": 0, "end": 0},
+    37: {"start": 0, "end": 0}, 38: {"start": 0, "end": 0}, 39: {"start": 0, "end": 0},
+    40: {"start": 0, "end": 0}, 41: {"start": 0, "end": 0}, 42: {"start": 0, "end": 0},
+    43: {"start": 0, "end": 2}, 44: {"start": 2, "end": 0}, 45: {"start": 0, "end": 2},
+    46: {"start": 2, "end": 0}, 47: {"start": 0, "end": 0}, 48: {"start": 0, "end": 0},
+    49: {"start": 0, "end": 0}, 50: {"start": 0, "end": 1}, 51: {"start": 1, "end": 0},
+    52: {"start": 0, "end": 1}, 53: {"start": 1, "end": 0}, 54: {"start": 0, "end": 2},
+    55: {"start": 2, "end": 0}, 56: {"start": 0, "end": 2}, 57: {"start": 2, "end": 0},
+    58: {"start": 0, "end": 1}, 59: {"start": 1, "end": 0}, 60: {"start": 0, "end": 0},
+    61: {"start": 0, "end": 1}, 62: {"start": 1, "end": 2}, 63: {"start": 2, "end": 1},
+    64: {"start": 1, "end": 1}, 65: {"start": 1, "end": 2}, 66: {"start": 2, "end": 1},
+    67: {"start": 1, "end": 0}, 68: {"start": 0, "end": 2}, 69: {"start": 2, "end": 0},
+    70: {"start": 0, "end": 2}, 71: {"start": 2, "end": 2}, 72: {"start": 2, "end": 2},
+    73: {"start": 2, "end": 2}, 74: {"start": 2, "end": 2}, 75: {"start": 2, "end": 0},
+    76: {"start": 0, "end": 1}, 77: {"start": 1, "end": 1}, 78: {"start": 1, "end": 0},
+    79: {"start": 0, "end": 0},
+}
+
+# Geriye donuk adlandirma uyumu.
+exon_phases = LEIDEN_DMD_EXON_PHASES
+
+
+def _validate_exon_phase_map(phase_map: dict[int, dict[str, int]]) -> bool:
+    if not isinstance(phase_map, dict) or len(phase_map) != 79:
+        return False
+    for exon in range(1, 80):
+        row = phase_map.get(exon)
+        if not isinstance(row, dict):
+            return False
+        s = row.get("start")
+        e = row.get("end")
+        if s not in (0, 1, 2) or e not in (0, 1, 2):
+            return False
+    return True
+
+
+def _normalize_deleted_exons(deleted_exons: list[int]) -> list[int]:
+    return sorted({int(x) for x in (deleted_exons or []) if 1 <= int(x) <= 79})
+
+
+def _contiguous_blocks(exons: list[int]) -> list[tuple[int, int]]:
+    normalized = _normalize_deleted_exons(exons)
+    if not normalized:
+        return []
+    blocks: list[tuple[int, int]] = []
+    block_start = normalized[0]
+    block_end = normalized[0]
+    for exon in normalized[1:]:
+        if exon == block_end + 1:
+            block_end = exon
+        else:
+            blocks.append((block_start, block_end))
+            block_start = exon
+            block_end = exon
+    blocks.append((block_start, block_end))
+    return blocks
+
+
+def _analyze_deleted_exon_block(start_exon: int, end_exon: int) -> dict:
+    prev_exon = start_exon - 1
+    next_exon = end_exon + 1
+    prev_end_phase = int(LEIDEN_DMD_EXON_PHASES.get(prev_exon, {}).get("end", 0))
+    next_start_phase = int(LEIDEN_DMD_EXON_PHASES.get(next_exon, {}).get("start", 0))
+    # Kural: silinen bloğun solundaki end phase ile sağındaki start phase eslesirse in-frame.
+    frame_ok = (prev_end_phase == next_start_phase)
+    return {
+        "start": int(start_exon),
+        "end": int(end_exon),
+        "prev_exon": prev_exon if prev_exon >= 1 else None,
+        "next_exon": next_exon if next_exon <= 79 else None,
+        "left_end_phase": prev_end_phase,
+        "right_start_phase": next_start_phase,
+        "ok": bool(frame_ok),
+    }
+
+
+def _analyze_deleted_exons(deleted_exons: list[int]) -> dict:
+    exons = _normalize_deleted_exons(deleted_exons)
+    if not exons:
+        return {"ok": None, "exons": [], "blocks": []}
+    blocks = _contiguous_blocks(exons)
+    block_rows = [_analyze_deleted_exon_block(s, e) for s, e in blocks]
+    return {"ok": all(r["ok"] for r in block_rows), "exons": exons, "blocks": block_rows}
+
+
+def _build_dna_track_df(deleted_exons: list[int]) -> pd.DataFrame:
+    deleted = set(_normalize_deleted_exons(deleted_exons))
+    return pd.DataFrame(
+        {
+            "x": list(range(1, 80)),
+            "y": [1] * 79,
+            "Durum": ["Silinmiş" if i in deleted else "Mevcut" for i in range(1, 80)],
+        }
+    )
+
+
+def dmd_dashboard() -> None:
+    st.subheader("DMD Genetik Analiz Modülü")
+    _clinical_evidence_caption("Karar-Destek", "Reading-frame analizi olası fenotipi destekler; kesin klinik yorum için genetik ve klinik bulgular birlikte değerlendirilir.")
+    if not _validate_exon_phase_map(LEIDEN_DMD_EXON_PHASES):
+        st.error("Faz veritabanı hatalı: 79 exon start/end (0,1,2) formatı doğrulanamadı.")
+        return
+    selected_exons = st.multiselect(
+        "Silinen Eksonlar (1-79)",
+        options=list(range(1, 80)),
+        default=st.session_state.get("dmd_deleted_exons", []),
+        key="dmd_deleted_exons",
+    )
+    analysis = _analyze_deleted_exons(selected_exons)
+    exons = analysis["exons"]
+    if analysis["ok"] is None:
+        st.info("Frame-shift analizi için en az bir ekson seçin.")
+    else:
+        if analysis["ok"]:
+            st.success(
+                "Analiz Sonucu: In-frame (Okuma Çerçevesi Korunmuş). Klinik tablo muhtemelen Becker (BMD) ile uyumludur."
+            )
+        else:
+            st.error(
+                "Analiz Sonucu: Out-of-frame (Okuma Çerçevesi Bozulmuş). Klinik tablo muhtemelen Duchenne (DMD) ile uyumludur."
+            )
+        for r in analysis["blocks"]:
+            st.caption(
+                f"Blok {r['start']}-{r['end']} | Önceki ekson: {r['prev_exon'] or '5-prime sınır'} "
+                f"(end phase={r['left_end_phase']}) | "
+                f"Sonraki ekson: {r['next_exon'] or '3-prime sınır'} "
+                f"(start phase={r['right_start_phase']}) | "
+                f"Durum: {'In-frame' if r['ok'] else 'Out-of-frame'}"
+            )
+
+    viz_df = _build_dna_track_df(exons)
+    if PLOTLY_OK:
+        fig = px.scatter(
+            viz_df,
+            x="x",
+            y="y",
+            color="Durum",
+            color_discrete_map={"Silinmiş": "#ef4444", "Mevcut": "#22c55e"},
+            title="Ekson Şeridi (1-79)",
+        )
+        fig.update_traces(marker_symbol="square", marker_size=18)
+        fig.update_layout(height=220, xaxis_title="Ekson", yaxis_title="", showlegend=True)
+        fig.update_yaxes(visible=False, showticklabels=False)
+        fig.update_xaxes(tickmode="linear", dtick=2, range=[0.5, 79.5])
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.warning("Plotly bulunamadı; görsel özet tablo olarak gösteriliyor.")
+        st.dataframe(viz_df, use_container_width=True, hide_index=True)
+
+
+NEURO_DYNAMIC_CONFIG = {
+    WORKSPACE_ALS: {
+        "title": "ALS Klinik İzlem",
+        "desc": "Motor, solunum ve fonksiyonel kayıp takibi",
+        "fields": [
+            {"key": "alsfrs_r", "label": "ALSFRS-R", "min": 0, "max": 48, "default": 40, "better_high": True},
+            {"key": "fvc_pct", "label": "FVC (%)", "min": 0, "max": 150, "default": 85, "better_high": True},
+            {"key": "bulbar_score", "label": "Bulbar Etkilenim", "min": 0, "max": 10, "default": 2, "better_high": False},
+        ],
+    },
+    WORKSPACE_ALZHEIMER: {
+        "title": "Alzheimer Klinik İzlem",
+        "desc": "Bilişsel ve fonksiyonel ilerleme takibi",
+        "fields": [
+            {"key": "mmse", "label": "MMSE", "min": 0, "max": 30, "default": 24, "better_high": True},
+            {"key": "adas_cog", "label": "ADAS-Cog", "min": 0, "max": 70, "default": 20, "better_high": False},
+            {"key": "adl_loss", "label": "ADL Kayıp Düzeyi", "min": 0, "max": 10, "default": 2, "better_high": False},
+        ],
+    },
+    WORKSPACE_PARKINSON: {
+        "title": "Parkinson Klinik İzlem",
+        "desc": "Motor şiddet, denge ve günlük yaşam etkisi",
+        "fields": [
+            {"key": "updrs_total", "label": "UPDRS Toplam", "min": 0, "max": 199, "default": 35, "better_high": False},
+            {"key": "hn_stage", "label": "Hoehn-Yahr Evresi", "min": 1, "max": 5, "default": 2, "better_high": False},
+            {"key": "fall_risk", "label": "Düşme Riski", "min": 0, "max": 10, "default": 3, "better_high": False},
+        ],
+    },
+    WORKSPACE_HUNTINGTON: {
+        "title": "Huntington Klinik İzlem",
+        "desc": "Motor-kognitif-fonksiyonel etkilenim takibi",
+        "fields": [
+            {"key": "uhdrs_motor", "label": "UHDRS Motor", "min": 0, "max": 124, "default": 28, "better_high": False},
+            {"key": "sdmt", "label": "SDMT", "min": 0, "max": 110, "default": 40, "better_high": True},
+            {"key": "tfc", "label": "TFC", "min": 0, "max": 13, "default": 9, "better_high": True},
+        ],
+    },
+    WORKSPACE_LEWY: {
+        "title": "Lewy Cisimcikli Demans Klinik İzlem",
+        "desc": "Bilişsel dalgalanma, nörops?kiyatrik ve parkinsonizm etkisi",
+        "fields": [
+            {"key": "mmse", "label": "MMSE", "min": 0, "max": 30, "default": 22, "better_high": True},
+            {"key": "hallucination", "label": "Halüsinasyon Şiddeti", "min": 0, "max": 12, "default": 3, "better_high": False},
+            {"key": "fluctuation", "label": "Bilişsel Dalgalanma", "min": 0, "max": 10, "default": 4, "better_high": False},
+        ],
+    },
+    WORKSPACE_FTD: {
+        "title": "Frontotemporal Demans Klinik İzlem",
+        "desc": "Davranış, dil ve yürütücü işlev etkilenimi",
+        "fields": [
+            {"key": "fbi", "label": "Frontal Behavioral Inventory", "min": 0, "max": 72, "default": 20, "better_high": False},
+            {"key": "language_impairment", "label": "Dil Etkilenimi", "min": 0, "max": 10, "default": 3, "better_high": False},
+            {"key": "adl_loss", "label": "ADL Kayıp Düzeyi", "min": 0, "max": 10, "default": 3, "better_high": False},
+        ],
+    },
+    WORKSPACE_SMA: {
+        "title": "SMA Klinik İzlem",
+        "desc": "Motor fonksiyon ve solunum performansı",
+        "fields": [
+            {"key": "hfmse", "label": "HFMSE", "min": 0, "max": 66, "default": 38, "better_high": True},
+            {"key": "rulm", "label": "RULM", "min": 0, "max": 37, "default": 24, "better_high": True},
+            {"key": "fvc_pct", "label": "FVC (%)", "min": 0, "max": 150, "default": 80, "better_high": True},
+        ],
+    },
+}
+
+
+def _sync_neuro_schema_from_config() -> None:
+    for disease, cfg in NEURO_DYNAMIC_CONFIG.items():
+        base_cols = list(NEURO_COMMON_DATA_COLUMNS)
+        for f in cfg.get("fields", []):
+            k = str(f.get("key", "")).strip()
+            if k and k not in base_cols:
+                base_cols.append(k)
+        if "progression_index" not in base_cols:
+            base_cols.append("progression_index")
+        NEURO_DISEASE_DATA_SCHEMA[disease] = base_cols
+
+
+_sync_neuro_schema_from_config()
+
+
+def _active_patient_scope_key() -> str:
+    pid = str(st.session_state.get("active_patient_id", "")).strip()
+    return pid or "_global"
+
+
+def _neuro_input_state_key(hastalik_turu: str) -> str:
+    return f"neuro_inputs::{_active_patient_scope_key()}::{hastalik_turu}"
+
+
+def _neuro_history_state_key(hastalik_turu: str) -> str:
+    return f"neuro_history::{_active_patient_scope_key()}::{hastalik_turu}"
+
+
+def _ensure_neuro_dynamic_state(hastalik_turu: str) -> None:
+    cfg = NEURO_DYNAMIC_CONFIG.get(hastalik_turu, {})
+    fields = cfg.get("fields", [])
+    state_key = _neuro_input_state_key(hastalik_turu)
+    history_key = _neuro_history_state_key(hastalik_turu)
+    if state_key not in st.session_state or not isinstance(st.session_state.get(state_key), dict):
+        st.session_state[state_key] = {}
+    for f in fields:
+        k = str(f.get("key"))
+        dv = float(f.get("default", 0))
+        st.session_state[state_key].setdefault(k, dv)
+    if history_key not in st.session_state or not isinstance(st.session_state.get(history_key), list):
+        st.session_state[history_key] = []
+    if not st.session_state.get(history_key):
+        store = st.session_state.get("neuro_dynamic_records", {})
+        if isinstance(store, dict):
+            patient_key = _active_patient_scope_key()
+            saved_hist = []
+            patient_bucket = store.get(patient_key, {})
+            if isinstance(patient_bucket, dict):
+                saved_hist = patient_bucket.get(hastalik_turu, [])
+            # Legacy fallback: flat disease -> history
+            if not saved_hist:
+                saved_hist = store.get(hastalik_turu, [])
+            if isinstance(saved_hist, list):
+                st.session_state[history_key] = saved_hist[-120:]
+
+
+def _metric_burden(value: float, min_v: float, max_v: float, better_high: bool) -> float:
+    span = max(float(max_v) - float(min_v), 1.0)
+    norm = (float(value) - float(min_v)) / span
+    norm = max(0.0, min(norm, 1.0))
+    return (1.0 - norm) * 100.0 if better_high else norm * 100.0
+
+
+def analiz_yap(hastalik_turu: str, girdiler: dict) -> dict:
+    cfg = NEURO_DYNAMIC_CONFIG.get(hastalik_turu, {})
+    fields = cfg.get("fields", [])
+    if not fields:
+        return {"progression_index": 0.0, "stage": "NA", "metric_rows": []}
+    metric_rows = []
+    burdens = []
+    for f in fields:
+        key = str(f.get("key"))
+        val = float(girdiler.get(key, f.get("default", 0)))
+        min_v = float(f.get("min", 0))
+        max_v = float(f.get("max", 100))
+        better_high = bool(f.get("better_high", True))
+        burden = _metric_burden(val, min_v, max_v, better_high)
+        burdens.append(burden)
+        metric_rows.append({"metric": str(f.get("label", key)), "value": val, "burden": round(burden, 2)})
+    progression_index = round(sum(burdens) / len(burdens), 2) if burdens else 0.0
+    if progression_index < 33:
+        stage = "Düşük Etkilenim"
+    elif progression_index < 66:
+        stage = "Orta Etkilenim"
+    else:
+        stage = "Yüksek Etkilenim"
+    return {"progression_index": progression_index, "stage": stage, "metric_rows": metric_rows}
+
+
+def _render_neuro_charts(hastalik_turu: str, analiz: dict) -> None:
+    metric_rows = analiz.get("metric_rows", [])
+    history = st.session_state.get(_neuro_history_state_key(hastalik_turu), [])
+    if PLOTLY_OK and metric_rows:
+        cur_df = pd.DataFrame(metric_rows)
+        fig_cur = px.bar(
+            cur_df,
+            x="metric",
+            y="burden",
+            title="Güncel Kayıp Yükü Dağılımı",
+            color="burden",
+            color_continuous_scale="RdYlGn_r",
+        )
+        fig_cur.update_layout(height=320, yaxis_title="Kayıp Yükü (%)", xaxis_title="")
+        st.plotly_chart(fig_cur, use_container_width=True)
+    if history:
+        hist_df = pd.DataFrame(history)
+        if "time" in hist_df.columns and "progression_index" in hist_df.columns:
+            if PLOTLY_OK:
+                fig_line = px.line(
+                    hist_df,
+                    x="time",
+                    y="progression_index",
+                    markers=True,
+                    title="Progresyon Eğrisi",
+                )
+                fig_line.update_layout(height=320, yaxis_title="Progresyon İndeksi")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(hist_df.set_index("time")[["progression_index"]], use_container_width=True)
+
+
+def _save_neuro_history_record(hastalik_turu: str, rec: dict) -> None:
+    hist_key = _neuro_history_state_key(hastalik_turu)
+    hist = st.session_state.get(hist_key, [])
+    if not isinstance(hist, list):
+        hist = []
+    hist.append(rec if isinstance(rec, dict) else {})
+    st.session_state[hist_key] = hist[-120:]
+    store = st.session_state.get("neuro_dynamic_records", {})
+    if not isinstance(store, dict):
+        store = {}
+    patient_key = _active_patient_scope_key()
+    patient_bucket = store.get(patient_key, {})
+    if not isinstance(patient_bucket, dict):
+        patient_bucket = {}
+    patient_bucket[hastalik_turu] = st.session_state[hist_key]
+    store[patient_key] = patient_bucket
+    st.session_state["neuro_dynamic_records"] = store
+
+
+def _render_dynamic_neuro_dashboard(hastalik_turu: str) -> None:
+    cfg = NEURO_DYNAMIC_CONFIG.get(hastalik_turu)
+    if not cfg:
+        st.warning("Bu hastalık için dinamik modül çok yakında eklenecektir.")
+        return
+    _ensure_neuro_dynamic_state(hastalik_turu)
+    state_key = _neuro_input_state_key(hastalik_turu)
+    state_vals = st.session_state.get(state_key, {})
+    st.subheader(cfg.get("title", "Klinik İzlem"))
+    st.caption(cfg.get("desc", ""))
+
+    fields = cfg.get("fields", [])
+    cols = st.columns(len(fields)) if fields else []
+    for i, f in enumerate(fields):
+        with cols[i]:
+            key = str(f.get("key"))
+            ui_key = f"{_active_patient_scope_key()}::{hastalik_turu}::{key}"
+            val = st.number_input(
+                str(f.get("label", key)),
+                min_value=float(f.get("min", 0)),
+                max_value=float(f.get("max", 100)),
+                value=float(state_vals.get(key, f.get("default", 0))),
+                key=ui_key,
+            )
+            state_vals[key] = float(val)
+    st.session_state[state_key] = state_vals
+
+    analiz = analiz_yap(hastalik_turu, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+    c1, c2 = st.columns(2)
+    with c1:
+        st.metric("Progresyon İndeksi", f"{pidx:.1f} / 100")
+    with c2:
+        st.metric("Klinik Etkilenim", str(analiz.get("stage", "-")))
+    if pidx < 33:
+        st.success("Klinik tablo düşük etkilenim düzeyinde görünüyor.")
+    elif pidx < 66:
+        st.warning("Klinik tablo orta etkilenim düzeyinde görünüyor.")
+    else:
+        st.error("Klinik tablo yüksek etkilenim düzeyinde görünüyor.")
+
+    if st.button("Ölçümü Kaydet", key=f"save_neuro_{hastalik_turu}", use_container_width=True):
+        rec = {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "progression_index": pidx, **state_vals}
+        _save_neuro_history_record(hastalik_turu, rec)
+        save_current_session_profile()
+        st.success("Ölçüm kaydedildi.")
+
+    _render_neuro_charts(hastalik_turu, analiz)
+
+
+ALSFRS_ITEMS = [
+    "1. Konuşma",
+    "2. Salivasyon",
+    "3. Yutma",
+    "4. El yazısı",
+    "5. Yemek kesme / kap kullanımı",
+    "6. Giyinme ve hijyen",
+    "7. Yatakta dönme / örtü düzenleme",
+    "8. Yürüme",
+    "9. Merdiven çıkma",
+    "10. Dispne",
+    "11. Ortopne",
+    "12. Solunum desteği",
+]
+
+
+def _alsfrs_state_key() -> str:
+    return f"alsfrs_items::{_active_patient_scope_key()}"
+
+
+def _ensure_alsfrs_state() -> None:
+    key = _alsfrs_state_key()
+    values = st.session_state.get(key, [])
+    if not isinstance(values, list) or len(values) != 12:
+        values = [4] * 12
+    values = [max(0, min(4, int(v))) for v in values]
+    st.session_state[key] = values
+
+
+def _als_domain_scores(item_scores: list[int]) -> dict[str, int]:
+    s = [max(0, min(4, int(v))) for v in (item_scores or [0] * 12)]
+    return {
+        "Bulber": sum(s[0:3]),
+        "İnce Motor": sum(s[3:6]),
+        "Kaba Motor": sum(s[6:9]),
+        "Solunum": sum(s[9:12]),
+    }
+
+
+def _als_progression_summary(history: list[dict]) -> tuple[float | None, str]:
+    if not isinstance(history, list) or len(history) < 2:
+        return (None, "Yeterli ALSFRS-R geçmişi yok.")
+    df = pd.DataFrame(history)
+    if "alsfrs_r" not in df.columns:
+        return (None, "Yeterli ALSFRS-R geçmişi yok.")
+    df = df.dropna(subset=["alsfrs_r"])
+    if len(df) < 2:
+        return (None, "Yeterli ALSFRS-R geçmişi yok.")
+    first = float(df.iloc[0]["alsfrs_r"])
+    last = float(df.iloc[-1]["alsfrs_r"])
+    n = len(df) - 1
+    decline_per_visit = (last - first) / n if n > 0 else 0.0
+    if decline_per_visit <= -2:
+        msg = "Hızlı progresyon olasılığı: yakın aralıklı multidisipliner izlem önerilir."
+    elif decline_per_visit <= -1:
+        msg = "Orta progresyon eğilimi mevcut."
+    else:
+        msg = "Stabil/yavaş progresyon eğilimi."
+    return (round(decline_per_visit, 2), msg)
+
+
+def als_dashboard() -> None:
+    _ensure_neuro_dynamic_state(WORKSPACE_ALS)
+    _ensure_alsfrs_state()
+    scope = _active_patient_scope_key()
+    als_items = list(st.session_state.get(_alsfrs_state_key(), [4] * 12))
+    state_key = _neuro_input_state_key(WORKSPACE_ALS)
+    state_vals = st.session_state.get(state_key, {})
+
+    st.markdown(
+        """
+        <div style="background: linear-gradient(135deg, #0891b2 0%, #2563eb 100%); padding: 24px; border-radius: 18px; color: white; margin-bottom: 20px;">
+            <h2 style="margin:0;">ALS Klinik Operasyon Paneli</h2>
+            <p style="margin:6px 0 0 0; opacity:0.92;">ALSFRS-R + Solunum/Bulber Risk Tabanlı İzlem</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.expander("ℹ ALSFRS-R Puanlama Rehberi"):
+        st.markdown(
+            "- **4:** Normal fonksiyon\n"
+            "- **3:** Hafif etkilenim\n"
+            "- **2:** Orta etkilenim\n"
+            "- **1:** Belirgin etkilenim\n"
+            "- **0:** Fonksiyon kaybı"
+        )
+
+    a1, a2, a3 = st.columns(3)
+    if a1.button("Tümünü 4 Yap", key=f"als_all4_{scope}", use_container_width=True):
+        st.session_state[_alsfrs_state_key()] = [4] * 12
+        st.rerun()
+    if a2.button("Tümünü 2 Yap", key=f"als_all2_{scope}", use_container_width=True):
+        st.session_state[_alsfrs_state_key()] = [2] * 12
+        st.rerun()
+    if a3.button("Sıfırla", key=f"als_reset_{scope}", use_container_width=True):
+        st.session_state[_alsfrs_state_key()] = [0] * 12
+        st.rerun()
+
+    c1, c2 = st.columns(2)
+    for i, label in enumerate(ALSFRS_ITEMS):
+        target_col = c1 if i < 6 else c2
+        with target_col:
+            st.markdown(f"**{label}**")
+            widget_key = f"als_item::{scope}::{i}"
+            if hasattr(st, "segmented_control"):
+                score_i = st.segmented_control(
+                    label=f"ALS Item {i + 1}",
+                    options=[0, 1, 2, 3, 4],
+                    default=int(als_items[i]),
+                    key=widget_key,
+                    label_visibility="collapsed",
+                )
+            else:
+                score_i = st.radio(
+                    label=f"ALS Item {i + 1}",
+                    options=[0, 1, 2, 3, 4],
+                    index=int(als_items[i]),
+                    key=widget_key,
+                    horizontal=True,
+                    label_visibility="collapsed",
+                )
+            als_items[i] = int(score_i if score_i is not None else 0)
+
+    st.session_state[_alsfrs_state_key()] = als_items
+    alsfrs_total = int(sum(als_items))
+    domain_scores = _als_domain_scores(als_items)
+
+    s1, s2, s3 = st.columns(3)
+    with s1:
+        fvc_pct = st.number_input(
+            "FVC (%)",
+            min_value=0.0,
+            max_value=150.0,
+            value=float(state_vals.get("fvc_pct", 85.0)),
+            step=1.0,
+            key=f"als_fvc::{scope}",
+        )
+    with s2:
+        snip = st.number_input(
+            "SNIP (cmH2O)",
+            min_value=0.0,
+            max_value=200.0,
+            value=float(state_vals.get("snip", 60.0)),
+            step=1.0,
+            key=f"als_snip::{scope}",
+        )
+    with s3:
+        cough_peak = st.number_input(
+            "Peak Cough Flow (L/dk)",
+            min_value=0.0,
+            max_value=800.0,
+            value=float(state_vals.get("cough_peak", 280.0)),
+            step=5.0,
+            key=f"als_cough::{scope}",
+        )
+
+    bulbar_impairment = max(0, 12 - int(domain_scores["Bulber"]))
+    state_vals.update(
+        {
+            "alsfrs_r": float(alsfrs_total),
+            "fvc_pct": float(fvc_pct),
+            "bulbar_score": float(bulbar_impairment),
+            "snip": float(snip),
+            "cough_peak": float(cough_peak),
+        }
+    )
+    st.session_state[state_key] = state_vals
+    analiz = analiz_yap(WORKSPACE_ALS, state_vals)
+
+    r1, r2, r3 = st.columns(3)
+    with r1:
+        st.metric("ALSFRS-R", f"{alsfrs_total} / 48")
+    with r2:
+        st.metric("FVC", f"{float(fvc_pct):.0f}%")
+    with r3:
+        st.metric("Bulber Etkilenim", f"{bulbar_impairment} / 12")
+
+    if fvc_pct < 50 or cough_peak < 160:
+        st.error("Solunum riski artmış olabilir: NIV ve sekresyon yönetimi açısından acil klinik değerlendirme önerilir.")
+    elif fvc_pct < 70 or cough_peak < 240:
+        st.warning("Solunum riski orta olabilir: takip sıklığı ve değerlendirme planı artırılmalı.")
+    else:
+        st.success("Solunum parametreleri göreceli stabil.")
+    st.caption("Not: FVC/CPF eşikleri nöromüsküler literatürde karar desteği için kullanılır; tek başına tanı/tedavi kararı yerine geçmez.")
+
+    d1, d2, d3, d4 = st.columns(4)
+    d1.metric("Bulber", f"{domain_scores['Bulber']} / 12")
+    d2.metric("İnce Motor", f"{domain_scores['İnce Motor']} / 12")
+    d3.metric("Kaba Motor", f"{domain_scores['Kaba Motor']} / 12")
+    d4.metric("Solunum", f"{domain_scores['Solunum']} / 12")
+
+    hist_key = _neuro_history_state_key(WORKSPACE_ALS)
+    als_history = st.session_state.get(hist_key, [])
+    slope, slope_msg = _als_progression_summary(als_history)
+    if slope is None:
+        st.info(slope_msg)
+    else:
+        st.caption(f"ALSFRS-R ortalama değişim/ziyaret: {slope:+.2f} | {slope_msg}")
+
+    if st.button("ALS Ölçümünü Kaydet", key=f"save_als_detailed::{scope}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "alsfrs_r": float(alsfrs_total),
+            "fvc_pct": float(fvc_pct),
+            "bulbar_score": float(bulbar_impairment),
+            "snip": float(snip),
+            "cough_peak": float(cough_peak),
+            "progression_index": float(analiz.get("progression_index", 0.0)),
+            "alsfrs_items": list(als_items),
+            "domain_scores": dict(domain_scores),
+        }
+        _save_neuro_history_record(WORKSPACE_ALS, rec)
+        save_current_session_profile()
+        st.success("ALS ölçümü kaydedildi.")
+
+    if PLOTLY_OK:
+        dom_df = pd.DataFrame(
+            [{"domain": k, "score": v, "max": 12} for k, v in domain_scores.items()]
+        )
+        fig_dom = px.bar(
+            dom_df,
+            x="domain",
+            y="score",
+            title="ALSFRS-R Alt Domain Skorları",
+            color="score",
+            color_continuous_scale="Blues",
+        )
+        fig_dom.update_layout(height=300, xaxis_title="", yaxis_title="Skor")
+        st.plotly_chart(fig_dom, use_container_width=True)
+    else:
+        st.dataframe(
+            pd.DataFrame([{"Domain": k, "Skor": v} for k, v in domain_scores.items()]),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    if als_history:
+        df_hist = pd.DataFrame(als_history)
+        plot_cols = [c for c in ["alsfrs_r", "fvc_pct", "progression_index"] if c in df_hist.columns]
+        if "time" in df_hist.columns and plot_cols:
+            if PLOTLY_OK:
+                fig_line = px.line(
+                    df_hist,
+                    x="time",
+                    y=plot_cols,
+                    markers=True,
+                    title="ALS Progresyon Eğrileri",
+                )
+                fig_line.update_layout(height=350, xaxis_title="", yaxis_title="Skor")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(df_hist.set_index("time")[plot_cols], use_container_width=True)
+        with st.expander("Son ALS Kayıtları (5)"):
+            for rec in reversed(als_history[-5:]):
+                st.write(
+                    f"- {rec.get('time','-')} | ALSFRS-R: {rec.get('alsfrs_r','-')} | "
+                    f"FVC: {rec.get('fvc_pct','-')}% | PI: {rec.get('progression_index','-')}"
+                )
+
+
+def _trend_per_visit(history: list[dict], col: str) -> float | None:
+    if not isinstance(history, list) or len(history) < 2:
+        return None
+    df = pd.DataFrame(history)
+    if col not in df.columns:
+        return None
+    df = df.dropna(subset=[col])
+    if len(df) < 2:
+        return None
+    first = float(df.iloc[0][col])
+    last = float(df.iloc[-1][col])
+    n = len(df) - 1
+    return (last - first) / n if n > 0 else 0.0
+
+
+def alzheimer_dashboard() -> None:
+    _ensure_neuro_dynamic_state(WORKSPACE_ALZHEIMER)
+    scope = _active_patient_scope_key()
+    state_key = _neuro_input_state_key(WORKSPACE_ALZHEIMER)
+    state_vals = st.session_state.get(state_key, {})
+
+    st.markdown(
+        """
+        <div style="background: linear-gradient(135deg, #0ea5a4 0%, #1d4ed8 100%); padding: 24px; border-radius: 18px; color: white; margin-bottom: 20px;">
+            <h2 style="margin:0;">Alzheimer Klinik Operasyon Paneli</h2>
+            <p style="margin:6px 0 0 0; opacity:0.92;">Bilişsel Fonksiyon, Davranış ve Günlük Yaşam İzlemi</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        mmse = st.number_input("MMSE", 0, 30, int(state_vals.get("mmse", 24)), key=f"ad_mmse::{scope}")
+        moca = st.number_input("MoCA", 0, 30, int(state_vals.get("moca", 21)), key=f"ad_moca::{scope}")
+    with c2:
+        cdr_sum = st.number_input("CDR-SB", 0.0, 18.0, float(state_vals.get("cdr_sum", 4.0)), step=0.5, key=f"ad_cdr::{scope}")
+        adas_cog = st.number_input("ADAS-Cog", 0.0, 70.0, float(state_vals.get("adas_cog", 20.0)), step=1.0, key=f"ad_adas::{scope}")
+    with c3:
+        adl_ind = st.number_input("ADL Bağımsızlık (%)", 0.0, 100.0, float(state_vals.get("adl_independence", 75.0)), step=1.0, key=f"ad_adl::{scope}")
+        npi = st.number_input("NPI Davranış Skoru", 0.0, 144.0, float(state_vals.get("npi", 10.0)), step=1.0, key=f"ad_npi::{scope}")
+
+    # Dynamic config ile uyumlu anahtarları da güncelle.
+    state_vals.update(
+        {
+            "mmse": float(mmse),
+            "adas_cog": float(adas_cog),
+            "adl_loss": float(max(0.0, 100.0 - float(adl_ind))) / 10.0,
+            "moca": float(moca),
+            "cdr_sum": float(cdr_sum),
+            "adl_independence": float(adl_ind),
+            "npi": float(npi),
+        }
+    )
+    st.session_state[state_key] = state_vals
+
+    analiz = analiz_yap(WORKSPACE_ALZHEIMER, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+    m1, m2, m3 = st.columns(3)
+    m1.metric("MMSE", f"{int(mmse)} / 30")
+    m2.metric("CDR-SB", f"{float(cdr_sum):.1f} / 18")
+    m3.metric("Progresyon İndeksi", f"{pidx:.1f} / 100")
+
+    if mmse < 10 or cdr_sum >= 12:
+        st.error("İleri düzey bilişsel etkilenim olasılığı: bakım yükü ve güvenlik planı yakın izlenmeli.")
+    elif mmse < 20 or cdr_sum >= 6:
+        st.warning("Orta düzey bilişsel etkilenim olasılığı: fonksiyonel destek planı güçlendirilmeli.")
+    else:
+        st.success("Erken/hafif evre profili: düzenli bilişsel izlem sürdürülmeli.")
+    st.caption("Not: MMSE/CDR-SB aralıkları klinik destek amaçlıdır; kesin evreleme uzman değerlendirmesiyle yapılmalıdır.")
+
+    if st.button("Alzheimer Ölçümünü Kaydet", key=f"save_ad_detailed::{scope}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "mmse": float(mmse),
+            "moca": float(moca),
+            "cdr_sum": float(cdr_sum),
+            "adas_cog": float(adas_cog),
+            "adl_independence": float(adl_ind),
+            "npi": float(npi),
+            "progression_index": pidx,
+        }
+        _save_neuro_history_record(WORKSPACE_ALZHEIMER, rec)
+        save_current_session_profile()
+        st.success("Alzheimer ölçümü kaydedildi.")
+
+    if PLOTLY_OK:
+        cur_df = pd.DataFrame(
+            [
+                {"metric": "MMSE", "value": float(mmse), "max": 30.0},
+                {"metric": "MoCA", "value": float(moca), "max": 30.0},
+                {"metric": "CDR-SB", "value": float(cdr_sum), "max": 18.0},
+                {"metric": "ADAS-Cog", "value": float(adas_cog), "max": 70.0},
+                {"metric": "ADL %", "value": float(adl_ind), "max": 100.0},
+            ]
+        )
+        fig = px.bar(cur_df, x="metric", y="value", title="Alzheimer Güncel Skor Özeti", color="value", color_continuous_scale="Teal")
+        fig.update_layout(height=320, xaxis_title="", yaxis_title="Skor")
+        st.plotly_chart(fig, use_container_width=True)
+
+    ad_history = st.session_state.get(_neuro_history_state_key(WORKSPACE_ALZHEIMER), [])
+    if ad_history:
+        df = pd.DataFrame(ad_history)
+        cols = [c for c in ["mmse", "cdr_sum", "progression_index"] if c in df.columns]
+        if "time" in df.columns and cols:
+            if PLOTLY_OK:
+                fig_line = px.line(df, x="time", y=cols, markers=True, title="Alzheimer Progresyon Eğrileri")
+                fig_line.update_layout(height=340, xaxis_title="", yaxis_title="Skor")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(df.set_index("time")[cols], use_container_width=True)
+        slope = _trend_per_visit(ad_history, "mmse")
+        if slope is not None:
+            st.caption(f"MMSE ortalama değişim/ziyaret: {slope:+.2f}")
+        with st.expander("Son Alzheimer Kayıtları (5)"):
+            for rec in reversed(ad_history[-5:]):
+                st.write(
+                    f"- {rec.get('time','-')} | MMSE: {rec.get('mmse','-')} | "
+                    f"CDR-SB: {rec.get('cdr_sum','-')} | PI: {rec.get('progression_index','-')}"
+                )
+
+
+def parkinson_dashboard() -> None:
+    _ensure_neuro_dynamic_state(WORKSPACE_PARKINSON)
+    scope = _active_patient_scope_key()
+    state_key = _neuro_input_state_key(WORKSPACE_PARKINSON)
+    state_vals = st.session_state.get(state_key, {})
+
+    st.markdown(
+        """
+        <div style="background: linear-gradient(135deg, #0f766e 0%, #7c3aed 100%); padding: 24px; border-radius: 18px; color: white; margin-bottom: 20px;">
+            <h2 style="margin:0;">Parkinson Klinik Operasyon Paneli</h2>
+            <p style="margin:6px 0 0 0; opacity:0.92;">UPDRS, Evreleme ve Denge/Fall Riski İzlemi</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        updrs_1 = st.number_input("MDS-UPDRS I", 0, 52, int(state_vals.get("updrs_1", 8)), key=f"pd_up1::{scope}")
+        updrs_2 = st.number_input("MDS-UPDRS II", 0, 52, int(state_vals.get("updrs_2", 12)), key=f"pd_up2::{scope}")
+    with c2:
+        updrs_3 = st.number_input("MDS-UPDRS III", 0, 132, int(state_vals.get("updrs_3", 28)), key=f"pd_up3::{scope}")
+        updrs_4 = st.number_input("MDS-UPDRS IV", 0, 24, int(state_vals.get("updrs_4", 4)), key=f"pd_up4::{scope}")
+    with c3:
+        hn_stage = st.number_input("Hoehn-Yahr", 1.0, 5.0, float(state_vals.get("hn_stage", 2.0)), step=0.5, key=f"pd_hy::{scope}")
+        tug_sec = st.number_input("TUG (sn)", 0.0, 180.0, float(state_vals.get("tug_sec", 12.0)), step=0.5, key=f"pd_tug::{scope}")
+
+    p2, p3 = st.columns(2)
+    with p2:
+        falls_month = st.number_input("Aylık Düşme Sayısı", 0, 100, int(state_vals.get("falls_month", 1)), key=f"pd_falls::{scope}")
+    with p3:
+        freezing = st.number_input("Freezing Şiddeti", 0, 10, int(state_vals.get("freezing", 2)), key=f"pd_freeze::{scope}")
+
+    updrs_total = int(updrs_1 + updrs_2 + updrs_3 + updrs_4)
+    fall_risk = float(min(10, falls_month + (1 if tug_sec >= 13.5 else 0) + (1 if freezing >= 4 else 0)))
+    state_vals.update(
+        {
+            "updrs_1": float(updrs_1),
+            "updrs_2": float(updrs_2),
+            "updrs_3": float(updrs_3),
+            "updrs_4": float(updrs_4),
+            "updrs_total": float(updrs_total),
+            "hn_stage": float(hn_stage),
+            "tug_sec": float(tug_sec),
+            "falls_month": float(falls_month),
+            "freezing": float(freezing),
+            "fall_risk": float(fall_risk),
+        }
+    )
+    st.session_state[state_key] = state_vals
+    analiz = analiz_yap(WORKSPACE_PARKINSON, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("UPDRS Toplam", f"{updrs_total}")
+    m2.metric("Hoehn-Yahr", f"{hn_stage:.1f}")
+    m3.metric("Düşme Riski", f"{fall_risk:.1f} / 10")
+    m4.metric("Progresyon İndeksi", f"{pidx:.1f} / 100")
+
+    if hn_stage >= 4 or falls_month >= 4:
+        st.error("Yüksek denge/mobilite riski olasılığı: düşme önleme ve destek cihaz planı acil gözden geçirilmeli.")
+    elif hn_stage >= 3 or falls_month >= 2:
+        st.warning("Orta risk profili olasılığı: denge rehabilitasyonu ve ev içi güvenlik güçlendirilmeli.")
+    else:
+        st.success("Mobilite riski göreceli düşük/stabil.")
+    st.caption("Not: H&Y, düşme sayısı ve TUG birlikte yorumlanır; tek ölçütle tedavi kararı verilmez.")
+
+    if st.button("Parkinson Ölçümünü Kaydet", key=f"save_pd_detailed::{scope}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "updrs_total": float(updrs_total),
+            "updrs_1": float(updrs_1),
+            "updrs_2": float(updrs_2),
+            "updrs_3": float(updrs_3),
+            "updrs_4": float(updrs_4),
+            "hn_stage": float(hn_stage),
+            "tug_sec": float(tug_sec),
+            "falls_month": float(falls_month),
+            "freezing": float(freezing),
+            "fall_risk": float(fall_risk),
+            "progression_index": pidx,
+        }
+        _save_neuro_history_record(WORKSPACE_PARKINSON, rec)
+        save_current_session_profile()
+        st.success("Parkinson ölçümü kaydedildi.")
+
+    if PLOTLY_OK:
+        dom_df = pd.DataFrame(
+            [
+                {"domain": "UPDRS I", "score": updrs_1},
+                {"domain": "UPDRS II", "score": updrs_2},
+                {"domain": "UPDRS III", "score": updrs_3},
+                {"domain": "UPDRS IV", "score": updrs_4},
+            ]
+        )
+        fig_dom = px.bar(dom_df, x="domain", y="score", title="UPDRS Alt Domain Dağılımı", color="score", color_continuous_scale="Viridis")
+        fig_dom.update_layout(height=320, xaxis_title="", yaxis_title="Skor")
+        st.plotly_chart(fig_dom, use_container_width=True)
+
+    pd_history = st.session_state.get(_neuro_history_state_key(WORKSPACE_PARKINSON), [])
+    if pd_history:
+        df = pd.DataFrame(pd_history)
+        cols = [c for c in ["updrs_total", "hn_stage", "fall_risk", "progression_index"] if c in df.columns]
+        if "time" in df.columns and cols:
+            if PLOTLY_OK:
+                fig_line = px.line(df, x="time", y=cols, markers=True, title="Parkinson Progresyon Eğrileri")
+                fig_line.update_layout(height=340, xaxis_title="", yaxis_title="Skor")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(df.set_index("time")[cols], use_container_width=True)
+        slope = _trend_per_visit(pd_history, "updrs_total")
+        if slope is not None:
+            st.caption(f"UPDRS toplam ortalama değişim/ziyaret: {slope:+.2f}")
+        with st.expander("Son Parkinson Kayıtları (5)"):
+            for rec in reversed(pd_history[-5:]):
+                st.write(
+                    f"- {rec.get('time','-')} | UPDRS: {rec.get('updrs_total','-')} | "
+                    f"H&Y: {rec.get('hn_stage','-')} | PI: {rec.get('progression_index','-')}"
+                )
+
+
+def huntington_dashboard() -> None:
+    _ensure_neuro_dynamic_state(WORKSPACE_HUNTINGTON)
+    scope = _active_patient_scope_key()
+    state_key = _neuro_input_state_key(WORKSPACE_HUNTINGTON)
+    state_vals = st.session_state.get(state_key, {})
+
+    st.markdown(
+        """
+        <div style="background: linear-gradient(135deg, #0f766e 0%, #1d4ed8 100%); padding: 24px; border-radius: 18px; color: white; margin-bottom: 20px;">
+            <h2 style="margin:0;">Huntington Klinik Operasyon Paneli</h2>
+            <p style="margin:6px 0 0 0; opacity:0.92;">UHDRS Motor + Kognitif + Fonksiyonel İzlem</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        uhdrs_motor = st.number_input("UHDRS Motor", 0, 124, int(state_vals.get("uhdrs_motor", 28)), key=f"hd_motor::{scope}")
+        chorea = st.number_input("Kore Şiddeti", 0, 28, int(state_vals.get("chorea", 8)), key=f"hd_chorea::{scope}")
+    with c2:
+        sdmt = st.number_input("SDMT", 0, 110, int(state_vals.get("sdmt", 40)), key=f"hd_sdmt::{scope}")
+        stroop = st.number_input("Stroop Word", 0, 120, int(state_vals.get("stroop", 55)), key=f"hd_stroop::{scope}")
+    with c3:
+        tfc = st.number_input("TFC", 0, 13, int(state_vals.get("tfc", 9)), key=f"hd_tfc::{scope}")
+        adl_ind = st.number_input("ADL Bağımsızlık (%)", 0.0, 100.0, float(state_vals.get("adl_independence", 70.0)), step=1.0, key=f"hd_adl::{scope}")
+
+    state_vals.update(
+        {
+            "uhdrs_motor": float(uhdrs_motor),
+            "chorea": float(chorea),
+            "sdmt": float(sdmt),
+            "stroop": float(stroop),
+            "tfc": float(tfc),
+            "adl_independence": float(adl_ind),
+            "progression_hint": float(uhdrs_motor + chorea),
+        }
+    )
+    st.session_state[state_key] = state_vals
+    analiz = analiz_yap(WORKSPACE_HUNTINGTON, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("UHDRS Motor", str(int(uhdrs_motor)))
+    m2.metric("TFC", f"{int(tfc)} / 13")
+    m3.metric("SDMT", str(int(sdmt)))
+    m4.metric("Progresyon İndeksi", f"{pidx:.1f} / 100")
+
+    if tfc <= 4 or uhdrs_motor >= 60:
+        st.error("İleri fonksiyonel etkilenim olasılığı: güvenlik ve bakım planı sıkılaştırılmalı.")
+    elif tfc <= 8 or uhdrs_motor >= 35:
+        st.warning("Orta etkilenim olasılığı: takip aralığı ve rehabilitasyon planı güncellenmeli.")
+    else:
+        st.success("Fonksiyonel etkilenim düşük/orta-alt düzeyde.")
+    st.caption("Not: UHDRS-TMS ve TFC birlikte değerlendirilmelidir; klinik tablo multidisipliner olarak yorumlanır.")
+
+    if st.button("Huntington Ölçümünü Kaydet", key=f"save_hd_detailed::{scope}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "uhdrs_motor": float(uhdrs_motor),
+            "chorea": float(chorea),
+            "sdmt": float(sdmt),
+            "stroop": float(stroop),
+            "tfc": float(tfc),
+            "adl_independence": float(adl_ind),
+            "progression_index": pidx,
+        }
+        _save_neuro_history_record(WORKSPACE_HUNTINGTON, rec)
+        save_current_session_profile()
+        st.success("Huntington ölçümü kaydedildi.")
+
+    if PLOTLY_OK:
+        dom_df = pd.DataFrame(
+            [
+                {"metric": "UHDRS Motor", "value": uhdrs_motor},
+                {"metric": "Kore", "value": chorea},
+                {"metric": "SDMT", "value": sdmt},
+                {"metric": "TFC", "value": tfc},
+            ]
+        )
+        fig = px.bar(dom_df, x="metric", y="value", title="Huntington Güncel Skor Özeti", color="value", color_continuous_scale="Teal")
+        fig.update_layout(height=320, xaxis_title="", yaxis_title="Skor")
+        st.plotly_chart(fig, use_container_width=True)
+
+    hist = st.session_state.get(_neuro_history_state_key(WORKSPACE_HUNTINGTON), [])
+    if hist:
+        df = pd.DataFrame(hist)
+        cols = [c for c in ["uhdrs_motor", "tfc", "progression_index"] if c in df.columns]
+        if "time" in df.columns and cols:
+            if PLOTLY_OK:
+                fig_line = px.line(df, x="time", y=cols, markers=True, title="Huntington Progresyon Eğrileri")
+                fig_line.update_layout(height=340, xaxis_title="", yaxis_title="Skor")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(df.set_index("time")[cols], use_container_width=True)
+
+
+def lewy_body_dementia_dashboard() -> None:
+    _ensure_neuro_dynamic_state(WORKSPACE_LEWY)
+    scope = _active_patient_scope_key()
+    state_key = _neuro_input_state_key(WORKSPACE_LEWY)
+    state_vals = st.session_state.get(state_key, {})
+
+    st.markdown(
+        """
+        <div style="background: linear-gradient(135deg, #0f766e 0%, #6366f1 100%); padding: 24px; border-radius: 18px; color: white; margin-bottom: 20px;">
+            <h2 style="margin:0;">Lewy Cisimcikli Demans Klinik Operasyon Paneli</h2>
+            <p style="margin:6px 0 0 0; opacity:0.92;">Dalgalanma, Halüsinasyon ve Parkinsonizm Odaklı İzlem</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        mmse = st.number_input("MMSE", 0, 30, int(state_vals.get("mmse", 22)), key=f"lbd_mmse::{scope}")
+        fluctuation = st.number_input("Bilişsel Dalgalanma", 0, 10, int(state_vals.get("fluctuation", 4)), key=f"lbd_fluct::{scope}")
+    with c2:
+        hallucination = st.number_input("Halüsinasyon Şiddeti", 0, 12, int(state_vals.get("hallucination", 3)), key=f"lbd_hall::{scope}")
+        parkinsonism = st.number_input("Parkinsonizm Şiddeti", 0, 20, int(state_vals.get("parkinsonism", 6)), key=f"lbd_parkinson::{scope}")
+    with c3:
+        rem = st.number_input("REM Uyku Davranış Bozukluğu", 0, 10, int(state_vals.get("rbd", 3)), key=f"lbd_rbd::{scope}")
+        adl_ind = st.number_input("ADL Bağımsızlık (%)", 0.0, 100.0, float(state_vals.get("adl_independence", 65.0)), step=1.0, key=f"lbd_adl::{scope}")
+
+    state_vals.update(
+        {
+            "mmse": float(mmse),
+            "fluctuation": float(fluctuation),
+            "hallucination": float(hallucination),
+            "parkinsonism": float(parkinsonism),
+            "rbd": float(rem),
+            "adl_independence": float(adl_ind),
+        }
+    )
+    st.session_state[state_key] = state_vals
+    analiz = analiz_yap(WORKSPACE_LEWY, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("MMSE", f"{int(mmse)} / 30")
+    m2.metric("Nörops?kiyatrik Yük", f"{int(hallucination + fluctuation)}")
+    m3.metric("Progresyon İndeksi", f"{pidx:.1f} / 100")
+
+    if mmse < 12 or hallucination >= 8:
+        st.error("Yüksek nörops?kiyatrik risk: güvenlik ve bakım planı yakın izlenmeli.")
+    elif mmse < 20 or fluctuation >= 6:
+        st.warning("Orta risk profili: tedavi/izlem planı sıklaştırılmalı.")
+    else:
+        st.success("Klinik etkilenim düşük-orta seviyede.")
+
+    if st.button("Lewy Ölçümünü Kaydet", key=f"save_lbd_detailed::{scope}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "mmse": float(mmse),
+            "fluctuation": float(fluctuation),
+            "hallucination": float(hallucination),
+            "parkinsonism": float(parkinsonism),
+            "rbd": float(rem),
+            "adl_independence": float(adl_ind),
+            "progression_index": pidx,
+        }
+        _save_neuro_history_record(WORKSPACE_LEWY, rec)
+        save_current_session_profile()
+        st.success("Lewy ölçümü kaydedildi.")
+
+    if PLOTLY_OK:
+        cur_df = pd.DataFrame(
+            [
+                {"metric": "MMSE", "value": mmse},
+                {"metric": "Dalgalanma", "value": fluctuation},
+                {"metric": "Halüsinasyon", "value": hallucination},
+                {"metric": "Parkinsonizm", "value": parkinsonism},
+            ]
+        )
+        fig = px.bar(cur_df, x="metric", y="value", title="Lewy Güncel Skor Özeti", color="value", color_continuous_scale="Viridis")
+        fig.update_layout(height=320, xaxis_title="", yaxis_title="Skor")
+        st.plotly_chart(fig, use_container_width=True)
+
+    hist = st.session_state.get(_neuro_history_state_key(WORKSPACE_LEWY), [])
+    if hist:
+        df = pd.DataFrame(hist)
+        cols = [c for c in ["mmse", "hallucination", "fluctuation", "progression_index"] if c in df.columns]
+        if "time" in df.columns and cols:
+            if PLOTLY_OK:
+                fig_line = px.line(df, x="time", y=cols, markers=True, title="Lewy Progresyon Eğrileri")
+                fig_line.update_layout(height=340, xaxis_title="", yaxis_title="Skor")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(df.set_index("time")[cols], use_container_width=True)
+
+
+def ftd_dashboard() -> None:
+    _ensure_neuro_dynamic_state(WORKSPACE_FTD)
+    scope = _active_patient_scope_key()
+    state_key = _neuro_input_state_key(WORKSPACE_FTD)
+    state_vals = st.session_state.get(state_key, {})
+
+    st.markdown(
+        """
+        <div style="background: linear-gradient(135deg, #0ea5a4 0%, #7c3aed 100%); padding: 24px; border-radius: 18px; color: white; margin-bottom: 20px;">
+            <h2 style="margin:0;">FTD Klinik Operasyon Paneli</h2>
+            <p style="margin:6px 0 0 0; opacity:0.92;">Davranışsal ve Dil Alt Tiplerine Yönelik İzlem</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        fbi = st.number_input("FBI", 0, 72, int(state_vals.get("fbi", 20)), key=f"ftd_fbi::{scope}")
+        apathy = st.number_input("Apati", 0, 10, int(state_vals.get("apathy", 4)), key=f"ftd_apathy::{scope}")
+    with c2:
+        disinhibition = st.number_input("Disinhibisyon", 0, 10, int(state_vals.get("disinhibition", 4)), key=f"ftd_disin::{scope}")
+        language = st.number_input("Dil Etkilenimi", 0, 10, int(state_vals.get("language_impairment", 3)), key=f"ftd_lang::{scope}")
+    with c3:
+        executive = st.number_input("Yürütücü İşlev Etkilenimi", 0, 10, int(state_vals.get("executive", 4)), key=f"ftd_exec::{scope}")
+        adl_loss = st.number_input("ADL Kayıp Düzeyi", 0, 10, int(state_vals.get("adl_loss", 3)), key=f"ftd_adl_loss::{scope}")
+
+    state_vals.update(
+        {
+            "fbi": float(fbi),
+            "apathy": float(apathy),
+            "disinhibition": float(disinhibition),
+            "language_impairment": float(language),
+            "executive": float(executive),
+            "adl_loss": float(adl_loss),
+        }
+    )
+    st.session_state[state_key] = state_vals
+    analiz = analiz_yap(WORKSPACE_FTD, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("FBI", f"{int(fbi)} / 72")
+    m2.metric("Davranışsal Yük", f"{int(apathy + disinhibition)} / 20")
+    m3.metric("Progresyon İndeksi", f"{pidx:.1f} / 100")
+
+    if fbi >= 45 or adl_loss >= 7:
+        st.error("Yüksek davranışsal/fonksiyonel etkilenim olasılığı: bakım planı ve güvenlik önlemleri artırılmalı.")
+    elif fbi >= 25 or adl_loss >= 4:
+        st.warning("Orta etkilenim olasılığı: davranışsal müdahale ve takip sıklığı artırılmalı.")
+    else:
+        st.success("Etkilenim düşük-orta seviyede.")
+    st.caption("Not: FTD skorlama eşikleri merkezler arasında değişebilir; sonuçlar klinik görüşmeyle birlikte ele alınmalıdır.")
+
+    if st.button("FTD Ölçümünü Kaydet", key=f"save_ftd_detailed::{scope}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "fbi": float(fbi),
+            "apathy": float(apathy),
+            "disinhibition": float(disinhibition),
+            "language_impairment": float(language),
+            "executive": float(executive),
+            "adl_loss": float(adl_loss),
+            "progression_index": pidx,
+        }
+        _save_neuro_history_record(WORKSPACE_FTD, rec)
+        save_current_session_profile()
+        st.success("FTD ölçümü kaydedildi.")
+
+    if PLOTLY_OK:
+        cur_df = pd.DataFrame(
+            [
+                {"metric": "FBI", "value": fbi},
+                {"metric": "Apati", "value": apathy},
+                {"metric": "Disinhibisyon", "value": disinhibition},
+                {"metric": "Dil", "value": language},
+                {"metric": "Yürütücü", "value": executive},
+            ]
+        )
+        fig = px.bar(cur_df, x="metric", y="value", title="FTD Güncel Skor Özeti", color="value", color_continuous_scale="Magma")
+        fig.update_layout(height=320, xaxis_title="", yaxis_title="Skor")
+        st.plotly_chart(fig, use_container_width=True)
+
+    hist = st.session_state.get(_neuro_history_state_key(WORKSPACE_FTD), [])
+    if hist:
+        df = pd.DataFrame(hist)
+        cols = [c for c in ["fbi", "adl_loss", "progression_index"] if c in df.columns]
+        if "time" in df.columns and cols:
+            if PLOTLY_OK:
+                fig_line = px.line(df, x="time", y=cols, markers=True, title="FTD Progresyon Eğrileri")
+                fig_line.update_layout(height=340, xaxis_title="", yaxis_title="Skor")
+                st.plotly_chart(fig_line, use_container_width=True)
+            else:
+                st.line_chart(df.set_index("time")[cols], use_container_width=True)
+
+
+def sma_dashboard() -> None:
+    _render_dynamic_neuro_dashboard(WORKSPACE_SMA)
+
+
+WORKSPACE_DASHBOARD_HANDLERS = {
+    WORKSPACE_ALS: als_dashboard,
+    WORKSPACE_ALZHEIMER: alzheimer_dashboard,
+    WORKSPACE_PARKINSON: parkinson_dashboard,
+    WORKSPACE_HUNTINGTON: huntington_dashboard,
+    WORKSPACE_LEWY: lewy_body_dementia_dashboard,
+    WORKSPACE_FTD: ftd_dashboard,
+    WORKSPACE_SMA: sma_dashboard,
+}
+
+DISEASE_WORKSPACE_NAV_PAGES = [
+    "Ana Panel",
+    "Klinik Hesaplayıcı",
+    "Tam Ölçekli Test",
+    "Klinik Operasyon Merkezi",
+    "Klinik Takvim & Haklar",
+    "Acil Durum & Kritik Bakım",
+    "Sıkça Sorulan Sorular",
+    "Güncel Haberler",
+    "AI'ya Sor",
+    "Vizyon & İmza",
+]
+
+WORKSPACE_NEWS_QUERY = {
+    WORKSPACE_ALS: "amyotrophic lateral sclerosis",
+    WORKSPACE_ALZHEIMER: "alzheimer disease",
+    WORKSPACE_PARKINSON: "parkinson disease",
+    WORKSPACE_HUNTINGTON: "huntington disease",
+    WORKSPACE_LEWY: "dementia with lewy bodies",
+    WORKSPACE_FTD: "frontotemporal dementia",
+    WORKSPACE_SMA: "spinal muscular atrophy",
+}
+
+WORKSPACE_FULL_TEST_MODELS: dict[str, dict] = {
+    WORKSPACE_ALS: {
+        "name": "ALSFRS-R (12 Madde)",
+        "higher_is_better": True,
+        "items": [{"label": x, "min": 0, "max": 4} for x in ALSFRS_ITEMS],
+    },
+    WORKSPACE_ALZHEIMER: {
+        "name": "MMSE Domain Testi",
+        "higher_is_better": True,
+        "items": [
+            {"label": "Yonelim (Zaman)", "min": 0, "max": 5},
+            {"label": "Yonelim (Yer)", "min": 0, "max": 5},
+            {"label": "Kayıt / İsim Tekrarı", "min": 0, "max": 3},
+            {"label": "Dikkat / Hesaplama", "min": 0, "max": 5},
+            {"label": "Gecikmeli Hatirlama", "min": 0, "max": 3},
+            {"label": "Dil ve Komutlar", "min": 0, "max": 9},
+        ],
+    },
+    WORKSPACE_PARKINSON: {
+        "name": "UPDRS Hizli Tarama",
+        "higher_is_better": False,
+        "items": [
+            {"label": "Tremor", "min": 0, "max": 4},
+            {"label": "Bradikinezi", "min": 0, "max": 4},
+            {"label": "Rijidite", "min": 0, "max": 4},
+            {"label": "Postural Instabilite", "min": 0, "max": 4},
+            {"label": "Yürüme", "min": 0, "max": 4},
+            {"label": "Donakalma", "min": 0, "max": 4},
+            {"label": "Konuşma", "min": 0, "max": 4},
+            {"label": "Yutma", "min": 0, "max": 4},
+        ],
+    },
+    WORKSPACE_HUNTINGTON: {
+        "name": "UHDRS Motor+Fonksiyon Hizli",
+        "higher_is_better": False,
+        "items": [
+            {"label": "Kore", "min": 0, "max": 4},
+            {"label": "Distoni", "min": 0, "max": 4},
+            {"label": "Sakkad Takibi", "min": 0, "max": 4},
+            {"label": "Dizartri", "min": 0, "max": 4},
+            {"label": "Yuruyus", "min": 0, "max": 4},
+            {"label": "Denge", "min": 0, "max": 4},
+            {"label": "Fonksiyonel Bagimsizlik", "min": 0, "max": 4},
+            {"label": "ADL Destek Ihtiyaci", "min": 0, "max": 4},
+        ],
+    },
+    WORKSPACE_LEWY: {
+        "name": "Lewy Core Semptom Testi",
+        "higher_is_better": False,
+        "items": [
+            {"label": "Bilissel Dalgalanma", "min": 0, "max": 4},
+            {"label": "Görsel Halüsinasyon", "min": 0, "max": 4},
+            {"label": "Parkinsonizm", "min": 0, "max": 4},
+            {"label": "REM Uyku Davranis Bozuklugu", "min": 0, "max": 4},
+            {"label": "Dikkat ve Islemleme", "min": 0, "max": 4},
+            {"label": "ADL Etkilenimi", "min": 0, "max": 4},
+        ],
+    },
+    WORKSPACE_FTD: {
+        "name": "FTD Davranissal-Dil Testi",
+        "higher_is_better": False,
+        "items": [
+            {"label": "Apati", "min": 0, "max": 4},
+            {"label": "Disinhibisyon", "min": 0, "max": 4},
+            {"label": "Empati Kaybi", "min": 0, "max": 4},
+            {"label": "Dil Bozulmasi", "min": 0, "max": 4},
+            {"label": "Yürütücü İşlev", "min": 0, "max": 4},
+            {"label": "Sosyal Icgoru", "min": 0, "max": 4},
+            {"label": "ADL Etkilenimi", "min": 0, "max": 4},
+        ],
+    },
+    WORKSPACE_SMA: {
+        "name": "HFMSE (33 Madde)",
+        "higher_is_better": True,
+        "items": [{"label": f"HFMSE Madde {i}", "min": 0, "max": 2} for i in range(1, 34)],
+    },
+}
+
+
+def _clinical_evidence_caption(level: str, text: str) -> None:
+    lang = str(st.session_state.get("lang", "TR"))
+    raw_tag = str(level or "Bilgilendirme").strip()
+
+    tag_map = {
+        "TR": {
+            "Bilgilendirme": "Bilgilendirme",
+            "Karar-Destek": "Karar-Destek",
+            "Acil Uyarı": "Acil Uyarı",
+        },
+        "EN": {
+            "Bilgilendirme": "Information",
+            "Karar-Destek": "Decision Support",
+            "Acil Uyarı": "Emergency Notice",
+        },
+        "DE": {
+            "Bilgilendirme": "Information",
+            "Karar-Destek": "Entscheidungsunterstützung",
+            "Acil Uyarı": "Notfallhinweis",
+        },
+    }
+    label_map = {
+        "TR": "Kanıt Seviyesi",
+        "EN": "Evidence Level",
+        "DE": "Evidenzniveau",
+    }
+
+    label = label_map.get(lang, "Kanıt Seviyesi")
+    tag = tag_map.get(lang, tag_map["TR"]).get(raw_tag, raw_tag)
+    body = _i18n_text(str(text or ""))
+    st.caption(f"[{label}: {tag}] {body}")
+
+
+def _workspace_full_test_interpretation(workspace_mode: str, burden_pct: float) -> tuple[str, str]:
+    lvl = "low"
+    if burden_pct >= 66:
+        lvl = "high"
+    elif burden_pct >= 33:
+        lvl = "mid"
+
+    msg_map = {
+        WORKSPACE_ALS: {
+            "high": "ALS: Fonksiyonel yük belirgin. Solunum, bulber ve beslenme izlem planı hızlandırılmalı.",
+            "mid": "ALS: Orta düzey etkilenim. ALSFRS-R trendi ve solunum parametreleri daha sık izlenmeli.",
+            "low": "ALS: Etkilenim düşük. Standart multidisipliner takip sürdürülebilir.",
+        },
+        WORKSPACE_ALZHEIMER: {
+            "high": "Alzheimer: Bilişsel/fonksiyonel etkilenim yüksek olabilir. Güvenlik ve bakım planı güçlendirilmeli.",
+            "mid": "Alzheimer: Orta düzey etkilenim. Günlük yaşam desteği ve davranışsal izlem sıklaştırılmalı.",
+            "low": "Alzheimer: Erken/hafif etkilenim profili. Düzenli bilişsel takip sürdürülmeli.",
+        },
+        WORKSPACE_PARKINSON: {
+            "high": "Parkinson: Motor yük yüksek olabilir. Düşme önleme, rehabilitasyon ve ilaç zamanlaması gözden geçirilmeli.",
+            "mid": "Parkinson: Orta motor etkilenim. Yürüme-denge odaklı izlem artırılmalı.",
+            "low": "Parkinson: Motor etkilenim göreceli düşük. Rutin izlem sürdürülebilir.",
+        },
+        WORKSPACE_HUNTINGTON: {
+            "high": "Huntington: Motor/fonksiyonel etkilenim yüksek olabilir. Güvenlik ve bakım planı önceliklendirilmeli.",
+            "mid": "Huntington: Orta etkilenim. Kognitif-fonksiyonel destek planı güncellenmeli.",
+            "low": "Huntington: Etkilenim düşük-orta profilde. Düzenli takip sürdürülebilir.",
+        },
+        WORKSPACE_LEWY: {
+            "high": "Lewy: Core semptom yükü yüksek olabilir. Halüsinasyon-dalgalanma güvenlik planı yakından izlenmeli.",
+            "mid": "Lewy: Orta semptom yükü. Nöro-ps?kiyatrik izlem sıklaştırılmalı.",
+            "low": "Lewy: Semptom yükü düşük-orta. Planlı takip devam edebilir.",
+        },
+        WORKSPACE_FTD: {
+            "high": "FTD: Davranışsal/fonksiyonel yük yüksek olabilir. Bakım veren güvenliği ve davranış yönetimi güçlendirilmeli.",
+            "mid": "FTD: Orta düzey etkilenim. Davranışsal ve dil odaklı takip artırılmalı.",
+            "low": "FTD: Etkilenim düşük-orta. Planlı izlem sürdürülebilir.",
+        },
+        WORKSPACE_SMA: {
+            "high": "SMA: Motor etkilenim yüksek olabilir. Solunum ve fonksiyonel hedefler açısından yakın takip önemli.",
+            "mid": "SMA: Orta düzey etkilenim. HFMSE/RULM trendine göre rehabilitasyon planı güncellenmeli.",
+            "low": "SMA: Etkilenim düşük. Düzenli motor-solunum takibi sürdürülebilir.",
+        },
+    }
+    default_map = {
+        "high": "Yüksek etkilenim profili: takip sıklığı ve güvenlik planı güçlendirilmeli.",
+        "mid": "Orta etkilenim profili: izlem planı sıklaştırılmalıdır.",
+        "low": "Düşük etkilenim profili.",
+    }
+    selected = msg_map.get(workspace_mode, default_map)
+    return lvl, selected.get(lvl, default_map[lvl])
+
+
+def _workspace_next_control_plan(workspace_mode: str, severity: str) -> dict[str, str]:
+    sev = str(severity or "mid").strip().lower()
+    if sev not in {"low", "mid", "high"}:
+        sev = "mid"
+
+    # Intervals with explicit guideline support where available (ALS, Parkinson, SMA).
+    explicit_map = {
+        WORKSPACE_ALS: {
+            "high": "2-6 hafta",
+            "mid": "1-2 ay",
+            "low": "2-3 ay",
+            "basis": "NICE NG42 ALS izleminde düzenli multidisipliner değerlendirme (genellikle 2-3 ay) vurgular.",
+            "evidence": "Kılavuz + klinik bireyselleştirme",
+        },
+        WORKSPACE_PARKINSON: {
+            "high": "1-2 ay",
+            "mid": "2-4 ay",
+            "low": "6-12 ay",
+            "basis": "NICE NG71 stabil olguda periyodik izlem, değişken semptomlarda daha sık kontrol önerir.",
+            "evidence": "Kılavuz + klinik bireyselleştirme",
+        },
+        WORKSPACE_SMA: {
+            "high": "1-3 ay",
+            "mid": "3-6 ay",
+            "low": "6 ay",
+            "basis": "SMA bakım standartlarında fonksiyonel/solunumsal izlemin evreye göre 3-6 ay aralıkla planlanması yaygındır.",
+            "evidence": "Kılavuz/uzman konsensusu + bireyselleştirme",
+        },
+    }
+
+    # For diseases without a single fixed interval guideline, use conservative clinical cadence.
+    consensus_map = {
+        WORKSPACE_ALZHEIMER: {"high": "1-3 ay", "mid": "3 ay", "low": "6 ay"},
+        WORKSPACE_HUNTINGTON: {"high": "1-3 ay", "mid": "3 ay", "low": "3-6 ay"},
+        WORKSPACE_LEWY: {"high": "1-3 ay", "mid": "3 ay", "low": "3-6 ay"},
+        WORKSPACE_FTD: {"high": "1-3 ay", "mid": "3 ay", "low": "3-6 ay"},
+    }
+
+    if workspace_mode in explicit_map:
+        row = explicit_map[workspace_mode]
+        return {
+            "interval": row.get(sev, "3 ay"),
+            "basis": row.get("basis", ""),
+            "evidence": row.get("evidence", "Kılavuz"),
+            "personalized": False,
+            "risk_hits": [],
+        }
+
+    row = consensus_map.get(
+        workspace_mode,
+        {"high": "1-3 ay", "mid": "3 ay", "low": "6 ay"},
+    )
+    return {
+        "interval": row.get(sev, "3 ay"),
+        "basis": "Bu hastalık grubunda takip aralığı semptom hızı, bakım yükü ve güvenlik riskine göre bireyselleştirilir.",
+        "evidence": "Uzman konsensusu + bireyselleştirme",
+        "personalized": False,
+        "risk_hits": [],
+    }
+
+
+def _workspace_personal_risk_hits(workspace_mode: str) -> tuple[list[str], bool]:
+    state = st.session_state.get(_neuro_input_state_key(workspace_mode), {})
+    if not isinstance(state, dict):
+        state = {}
+    hits: list[str] = []
+    urgent = False
+
+    def f(key: str, default: float = 0.0) -> float:
+        try:
+            return float(state.get(key, default))
+        except Exception:
+            return float(default)
+
+    if workspace_mode == WORKSPACE_ALS:
+        fvc = f("fvc_pct", 100.0)
+        cough = f("cough_peak", 300.0)
+        if fvc < 50:
+            hits.append("FVC <%50")
+            urgent = True
+        elif fvc < 70:
+            hits.append("FVC <%70")
+        if cough < 160:
+            hits.append("Cough peak <160 L/dk")
+            urgent = True
+        elif cough < 240:
+            hits.append("Cough peak <240 L/dk")
+    elif workspace_mode == WORKSPACE_PARKINSON:
+        falls = f("falls_month", 0.0)
+        hy = f("hn_stage", 1.0)
+        tug = f("tug_sec", 10.0)
+        if falls >= 4:
+            hits.append("Aylık düşme >=4")
+            urgent = True
+        elif falls >= 2:
+            hits.append("Aylık düşme >=2")
+        if hy >= 4:
+            hits.append("Hoehn-Yahr >=4")
+            urgent = True
+        elif hy >= 3:
+            hits.append("Hoehn-Yahr >=3")
+        if tug >= 13.5:
+            hits.append("TUG >=13.5 sn")
+    elif workspace_mode == WORKSPACE_SMA:
+        fvc = f("fvc_pct", 100.0)
+        hfmse = f("hfmse", 66.0)
+        if fvc < 50:
+            hits.append("FVC <%50")
+            urgent = True
+        elif fvc < 70:
+            hits.append("FVC <%70")
+        if hfmse <= 20:
+            hits.append("HFMSE <=20")
+    elif workspace_mode == WORKSPACE_ALZHEIMER:
+        mmse = f("mmse", 30.0)
+        adl = f("adl_independence", 100.0)
+        if mmse < 10:
+            hits.append("MMSE <10")
+            urgent = True
+        elif mmse < 20:
+            hits.append("MMSE <20")
+        if adl < 50:
+            hits.append("ADL bağımsızlık <%50")
+    elif workspace_mode == WORKSPACE_HUNTINGTON:
+        tfc = f("tfc", 13.0)
+        uhdrs = f("uhdrs_motor", 0.0)
+        if tfc <= 4:
+            hits.append("TFC <=4")
+            urgent = True
+        elif tfc <= 8:
+            hits.append("TFC <=8")
+        if uhdrs >= 60:
+            hits.append("UHDRS motor >=60")
+            urgent = True
+        elif uhdrs >= 35:
+            hits.append("UHDRS motor >=35")
+    elif workspace_mode == WORKSPACE_LEWY:
+        mmse = f("mmse", 30.0)
+        hall = f("hallucination", 0.0)
+        fluc = f("fluctuation", 0.0)
+        if mmse < 12:
+            hits.append("MMSE <12")
+            urgent = True
+        elif mmse < 20:
+            hits.append("MMSE <20")
+        if hall >= 8:
+            hits.append("Halüsinasyon >=8")
+            urgent = True
+        elif fluc >= 6:
+            hits.append("Dalgalanma >=6")
+    elif workspace_mode == WORKSPACE_FTD:
+        fbi = f("fbi", 0.0)
+        adl_loss = f("adl_loss", 0.0)
+        if fbi >= 45:
+            hits.append("FBI >=45")
+            urgent = True
+        elif fbi >= 25:
+            hits.append("FBI >=25")
+        if adl_loss >= 7:
+            hits.append("ADL kaybi >=7")
+            urgent = True
+        elif adl_loss >= 4:
+            hits.append("ADL kaybi >=4")
+
+    return hits, urgent
+
+
+def _workspace_next_control_plan_personalized(
+    workspace_mode: str,
+    severity: str,
+    enabled: bool = True,
+) -> dict[str, str]:
+    base = _workspace_next_control_plan(workspace_mode, severity)
+    if not enabled:
+        return base
+
+    sev = str(severity or "mid").strip().lower()
+    if sev not in {"low", "mid", "high"}:
+        sev = "mid"
+    rank = {"low": 0, "mid": 1, "high": 2}
+    rank_rev = {0: "low", 1: "mid", 2: "high"}
+
+    hits, urgent = _workspace_personal_risk_hits(workspace_mode)
+    r = rank.get(sev, 1)
+    if urgent:
+        r = 2
+    elif len(hits) >= 2:
+        r = min(2, r + 1)
+    elif len(hits) == 1 and r == 0:
+        r = 1
+
+    adj_sev = rank_rev[r]
+    if urgent:
+        interval = "1-2 hafta"
+    else:
+        interval = _workspace_next_control_plan(workspace_mode, adj_sev).get("interval", base.get("interval", "3 ay"))
+
+    note = "Bireyselleştirilmiş takip aralığı aktif."
+    if hits:
+        note += " Dikkate alinan riskler: " + ", ".join(hits[:4]) + "."
+    else:
+        note += " Ek yüksek risk sinyali saptanmadı."
+
+    return {
+        **base,
+        "interval": interval,
+        "personalized": True,
+        "risk_hits": hits,
+        "basis": f"{base.get('basis', '')} {note}".strip(),
+    }
+
+
+WORKSPACE_FAQ_DATA: dict[str, list[dict[str, str]]] = {
+    WORKSPACE_ALS: [
+        {"c": "Temel", "q": "ALS nedir?", "a": "ALS, üst ve alt motor nöronları etkileyen ilerleyici bir nörolojik hastalıktır.", "l": "https://www.cdc.gov/als/about/faqs.html"},
+        {"c": "Temel", "q": "ALS'nin en sık erken belirtileri nelerdir?", "a": "Kas güçsüzlüğü, konuşma-yutma değişiklikleri ve ince motor becerilerde zorlanma sık başlangıç bulgularıdır.", "l": "https://www.cdc.gov/als/about/faqs.html"},
+        {"c": "Neden", "q": "ALS'nin nedeni kesin olarak biliniyor mu?", "a": "Vaka çoğunluğunda tek bir kesin neden gösterilemez; genetik ve çevresel faktörler birlikte rol oynayabilir.", "l": "https://www.cdc.gov/als/about/faqs.html"},
+        {"c": "Genetik", "q": "ALS kalıtsal olabilir mi?", "a": "Evet, bazı olgular aileseldir; genetik danışmanlık uygun hastalarda önemlidir.", "l": "https://www.mda.org/disease/amyotrophic-lateral-sclerosis/registry/faqs"},
+        {"c": "Tanı", "q": "ALS tanısı nasıl konur?", "a": "Klinik muayene, nörolojik testler ve benzer hastalıkları dışlama yaklaşımı birlikte kullanılır.", "l": "https://www.cdc.gov/als/about/faqs.html"},
+        {"c": "Seyir", "q": "Hastalık seyri herkeste aynı mıdır?", "a": "Hayır, progresyon hızı kişiden kişiye belirgin farklılık gösterebilir.", "l": "https://www.als.org/understanding-als/what-is-als"},
+        {"c": "Tedavi", "q": "ALS için kesin kür var mı?", "a": "Şu anda kesin kür yoktur; tedavi semptom kontrolü ve yaşam kalitesini artırmaya odaklanır.", "l": "https://www.ninds.nih.gov/health-information/disorders/amyotrophic-lateral-sclerosis-als"},
+        {"c": "Solunum", "q": "Solunum takibi neden kritik?", "a": "Solunum kasları etkilenebileceği için düzenli solunum izlemi komplikasyonları erken yakalamayı sağlar.", "l": "https://www.mndassociation.org"},
+        {"c": "Solunum", "q": "NIV ne zaman gündeme gelir?", "a": "Solunum kapasitesi düşüşü veya gece hipoventilasyon bulgularında uzman ekip tarafından değerlendirilir.", "l": "https://www.ninds.nih.gov/health-information/disorders/amyotrophic-lateral-sclerosis-als"},
+        {"c": "Beslenme", "q": "Yutma güçlüğünde ne yapılmalı?", "a": "Yutma değerlendirmesi, beslenme planı ve aspirasyon riskine yönelik önlemler erken planlanmalıdır.", "l": "https://www.als.org"},
+        {"c": "Bakım", "q": "Fizyoterapi ALS'de işe yarar mı?", "a": "Uygun dozda rehabilitasyon, hareketliliği ve günlük yaşam fonksiyonunu destekleyebilir.", "l": "https://www.als.org"},
+        {"c": "Bakım", "q": "Multidisipliner klinik neden önerilir?", "a": "Nöroloji, solunum, beslenme ve rehabilitasyonun birlikte yönetimi daha bütüncül bakım sağlar.", "l": "https://www.als.org"},
+        {"c": "Araştırma", "q": "Klinik araştırmalara nasıl katılabilirim?", "a": "Uygunluk kriterleri için klinik merkezler ve ClinicalTrials kayıtları takip edilmelidir.", "l": "https://clinicaltrials.gov"},
+        {"c": "Destek", "q": "Hasta yakını desteği nereden alınır?", "a": "Yerel dernekler, destek grupları ve sosyal hizmetler bakım veren yükünü azaltmada yardımcı olur.", "l": "https://www.als.org"},
+        {"c": "Güvenlik", "q": "Hangi durumda acil başvuru gerekir?", "a": "Ani nefes darlığı, sekresyon yönetememe veya hızlı kötüleşmede acil değerlendirme gerekir.", "l": "https://www.cdc.gov/als/about/faqs.html"},
+    ],
+    WORKSPACE_ALZHEIMER: [
+        {"c": "Temel", "q": "Alzheimer hastalığı nedir?", "a": "Alzheimer, ilerleyici bellek ve bilişsel işlev kaybına yol açan en sık demans nedenidir.", "l": "https://www.alz.org/alzheimers-dementia/what-is-alzheimers"},
+        {"c": "Temel", "q": "Normal yaşlanma ile Alzheimer nasıl ayrılır?", "a": "Günlük yaşamı bozan ilerleyici bellek ve işlev kaybı normal yaşlanmadan farklıdır.", "l": "https://www.alz.org/alzheimers-dementia/10_signs"},
+        {"c": "Belirti", "q": "Erken belirtiler nelerdir?", "a": "Yeni bilgiyi hatırlamada zorlanma, yönelim sorunları ve planlama güçlüğü sık görülen erken bulgulardır.", "l": "https://www.alz.org/alzheimers-dementia/10_signs"},
+        {"c": "Tanı", "q": "Tanı nasıl konur?", "a": "Öykü, bilişsel testler, laboratuvar ve gerekirse görüntüleme birlikte değerlendirilir.", "l": "https://www.nia.nih.gov/health/alzheimers-disease-fact-sheet"},
+        {"c": "Skor", "q": "MMSE ve MoCA ne işe yarar?", "a": "Bu testler bilişsel alanları tarar; tek başına tanı değil klinik değerlendirmeyi destekler.", "l": "https://www.alz.org"},
+        {"c": "Tedavi", "q": "Tamamen iyileştiren tedavi var mı?", "a": "Kesin kür yoktur; bazı tedaviler semptomları ve hastalık seyrini belirli düzeyde etkileyebilir.", "l": "https://www.nia.nih.gov/health/alzheimers-disease-fact-sheet"},
+        {"c": "Günlük Yaşam", "q": "Ev güvenliği nasıl artırılır?", "a": "Düşme önleme, ilaç düzeni, kapı-ocak güvenliği ve rutin planlama temel adımlardır.", "l": "https://www.alz.org/help-support/caregiving"},
+        {"c": "Davranış", "q": "Ajitasyon ve davranış değişiklikleri nasıl yönetilir?", "a": "Öncelik çevresel düzenleme, iletişim stratejileri ve tetikleyicileri azaltmaktır.", "l": "https://www.alz.org/help-support/caregiving"},
+        {"c": "İletişim", "q": "Hasta ile iletişimde nelere dikkat edilmeli?", "a": "Kısa, net cümleler ve sakin yaklaşım iletişim başarısını artırır.", "l": "https://www.alz.org/help-support/caregiving"},
+        {"c": "Bakım", "q": "Ne zaman profesyonel bakım düşünülmeli?", "a": "Güvenlik riski, ciddi işlev kaybı veya bakım veren tükenmişliğinde profesyonel destek planlanmalıdır.", "l": "https://www.alz.org/help-support/resources/helpline"},
+        {"c": "Risk", "q": "Aile öyküsü riski artırır mı?", "a": "Bazı genetik ve ailesel faktörler riski etkileyebilir; bu durum kişiye göre değerlendirilmelidir.", "l": "https://www.nia.nih.gov/health/alzheimers-and-genetics"},
+        {"c": "Yaşam Tarzı", "q": "Risk azaltmak için ne yapılabilir?", "a": "Fiziksel aktivite, kardiyovasküler risk kontrolü, uyku ve sosyal-bilişsel aktivite destekleyicidir.", "l": "https://www.alz.org/alzheimers-dementia/research_progress/prevention"},
+        {"c": "Destek", "q": "7/24 destek hattı var mı?", "a": "Alzheimer's Association 24/7 destek hattı ailelere bilgi ve kriz desteği sağlar.", "l": "https://www.alz.org/help-support/resources/helpline"},
+        {"c": "İleri Evre", "q": "Hastalığın ileri evresinde hangi sorunlar beklenir?", "a": "İletişim güçlüğü, yutma sorunları ve tam bakım gereksinimi artabilir.", "l": "https://www.nia.nih.gov/health/alzheimers-disease-fact-sheet"},
+        {"c": "Acil", "q": "Ne zaman acil yardım gerekir?", "a": "Ani bilinç değişikliği, düşme, susuzluk veya enfeksiyon şüphesinde acil değerlendirme gerekir.", "l": "https://www.alz.org/help-support/resources/helpline"},
+    ],
+    WORKSPACE_PARKINSON: [
+        {"c": "Temel", "q": "Parkinson hastalığı nedir?", "a": "Parkinson, hareket başta olmak üzere motor ve motor dışı belirtilerle seyreden ilerleyici nörolojik bir hastalıktır.", "l": "https://www.parkinson.org/understanding-parkinsons/what-is-parkinsons"},
+        {"c": "Belirti", "q": "En sık belirtiler nelerdir?", "a": "Titreme, yavaşlık, katılık ve denge sorunları temel motor belirtilerdir.", "l": "https://www.parkinson.org/understanding-parkinsons/symptoms"},
+        {"c": "Belirti", "q": "Motor dışı belirtiler olur mu?", "a": "Evet; uyku, kabızlık, depresyon, koku kaybı ve bilişsel değişiklikler görülebilir.", "l": "https://www.parkinson.org/understanding-parkinsons/non-movement-symptoms"},
+        {"c": "Tanı", "q": "Tanı için tek bir kesin test var mı?", "a": "Hayır; tanı klinik değerlendirme ile konur ve benzer nedenler dışlanır.", "l": "https://www.parkinson.org/understanding-parkinsons/diagnosis"},
+        {"c": "Skor", "q": "UPDRS neyi ölçer?", "a": "UPDRS, motor bulgular ve günlük yaşam etkilenimini yapılandırılmış biçimde izlemeye yardımcı olur.", "l": "https://www.parkinson.org/library/books/faq"},
+        {"c": "Skor", "q": "Hoehn-Yahr evresi neden kullanılır?", "a": "Hastalığın fonksiyonel evresini özetleyerek takip planına katkı sağlar.", "l": "https://www.parkinson.org/library/books/faq"},
+        {"c": "Tedavi", "q": "Parkinson tedavi edilebilir mi?", "a": "Kesin kür yoktur; ilaç, rehabilitasyon ve gerektiğinde girişimsel yöntemlerle semptom yönetilir.", "l": "https://www.parkinson.org/understanding-parkinsons/treatment"},
+        {"c": "İlaç", "q": "İlaç saatleri neden önemlidir?", "a": "Doz-zaman uyumu, semptom dalgalanmalarını azaltmada kritik rol oynar.", "l": "https://www.parkinson.org/library/books/faq"},
+        {"c": "Egzersiz", "q": "Egzersiz gerçekten faydalı mı?", "a": "Düzenli egzersiz mobilite, denge ve yaşam kalitesini destekler.", "l": "https://www.parkinson.org/living-with-parkinsons/exercise"},
+        {"c": "Risk", "q": "Düşme riski nasıl azaltılır?", "a": "Denge egzersizi, çevresel düzenleme ve ilaç planının gözden geçirilmesi önerilir.", "l": "https://www.parkinson.org/library/books/faq"},
+        {"c": "Günlük Yaşam", "q": "Beslenmede nelere dikkat edilmeli?", "a": "Yutma, kabızlık ve ilaç-etkileşimleri açısından kişiselleştirilmiş beslenme planı önemlidir.", "l": "https://www.parkinson.org/library/books/faq"},
+        {"c": "İleri Tedavi", "q": "DBS ne zaman düşünülür?", "a": "Uygun hastalarda uzman merkezlerde ilaçla yeterli kontrol sağlanamadığında değerlendirilir.", "l": "https://www.parkinson.org/understanding-parkinsons/treatment/surgical-treatment-options"},
+        {"c": "Kognitif", "q": "Parkinson'da demans gelişir mi?", "a": "Bazı hastalarda bilişsel etkilenim gelişebilir; düzenli bilişsel izlem önemlidir.", "l": "https://www.parkinson.org/library/books/faq"},
+        {"c": "Destek", "q": "Destek hizmetlerine nasıl ulaşırım?", "a": "Parkinson Foundation kaynakları, destek grupları ve helpline yönlendirmeleri yardımcı olur.", "l": "https://www.parkinson.org/blog/awareness/helpline-faq"},
+        {"c": "Acil", "q": "Hangi durumda acile başvurmalıyım?", "a": "Şiddetli düşme, ani bilinç değişikliği, ciddi yutma-solunum sorunu varsa acil değerlendirme gerekir.", "l": "https://www.parkinson.org/library/books/faq"},
+    ],
+    WORKSPACE_SMA: [
+        {"c": "Temel", "q": "SMA nedir?", "a": "SMA, motor nöronları etkileyen genetik bir nöromüsküler hastalıktır.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Tipler", "q": "SMA'nın tipleri nelerdir?", "a": "SMA farklı başlangıç yaşları ve fonksiyonel düzeylerle sınıflandırılan alt tiplere ayrılır.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Belirti", "q": "En sık belirtiler nelerdir?", "a": "Kas güçsüzlüğü, motor gecikme ve bazı olgularda solunum-yutma sorunları görülebilir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Genetik", "q": "SMA nasıl kalıtılır?", "a": "Sıklıkla otozomal resesif geçiş gösterir; taşıyıcılık değerlendirmesi önemlidir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Genetik", "q": "SMN1 ve SMN2 neden önemlidir?", "a": "SMN1 mutasyonu hastalığın temel nedenidir; SMN2 kopya sayısı fenotipi etkileyebilir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Tanı", "q": "SMA tanısı nasıl konur?", "a": "Genetik test tanıda temel yaklaşımdır ve klinik bulgularla birlikte değerlendirilir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Tedavi", "q": "SMA'da tedavi var mı?", "a": "Hastalığın seyrini etkileyebilen tedaviler ve destekleyici bakım seçenekleri mevcuttur.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Tedavi", "q": "Erken tedavi neden kritik?", "a": "Erken dönemde tedavi ve izlem, motor fonksiyon korunumu açısından daha iyi sonuçlarla ilişkilidir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Solunum", "q": "Solunum izlemi ne sıklıkla yapılmalı?", "a": "Fonksiyonel duruma göre düzenli solunum değerlendirmesi komplikasyonları azaltmaya yardımcı olur.", "l": "https://www.mda.org"},
+        {"c": "Rehabilitasyon", "q": "Fizyoterapi SMA'da gerekli mi?", "a": "Evet; eklem hareket açıklığı, postür ve fonksiyon korunumu için düzenli rehabilitasyon önerilir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Ortopedi", "q": "Skolyoz takibi neden önemli?", "a": "Omurga eğriliği solunum ve oturma dengesini etkileyebildiği için düzenli takip gerekir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Beslenme", "q": "Beslenme ve yutma desteği gerekir mi?", "a": "Bazı hastalarda yutma-güvenli beslenme planı ve beslenme desteği önemli olabilir.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Takip", "q": "HFMSE ve RULM neden takip edilir?", "a": "Bu ölçekler alt ve üst ekstremite fonksiyon değişimini izlemeye yardımcı olur.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Destek", "q": "Aileler için destek kaynakları var mı?", "a": "Hasta dernekleri, bakım rehberleri ve akran toplulukları uzun dönem bakımda önemli destek sağlar.", "l": "https://www.curesma.org/faqs/"},
+        {"c": "Acil", "q": "Hangi bulgular acil değerlendirme gerektirir?", "a": "Artan solunum sıkıntısı, sekresyon birikimi veya beslenememe durumunda acil başvuru gerekir.", "l": "https://www.mda.org"},
+    ],
+    WORKSPACE_HUNTINGTON: [
+        {"c": "Temel", "q": "Huntington hastalığı nedir?", "a": "Huntington, kalıtsal ve ilerleyici bir nörodejeneratif hastalıktır; motor, bilişsel ve psikiyatrik belirtilerle seyreder.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Genetik", "q": "Huntington kalıtsal mıdır?", "a": "Evet; otozomal dominant geçiş gösterir ve aile bireyleri için genetik danışmanlık önemlidir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Genetik", "q": "Prediktif genetik test ne zaman düşünülür?", "a": "At-risk bireylerde psikososyal ve etik danışmanlıkla birlikte uzman merkezlerde değerlendirilir.", "l": "https://hdsa.org/hdsa-helpline/"},
+        {"c": "Belirti", "q": "En sık erken belirtiler nelerdir?", "a": "Denge-motor değişiklikler, yürütücü işlev bozulması ve davranış-duygu değişiklikleri görülebilir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Belirti", "q": "Korea her hastada olur mu?", "a": "Sık görülse de her hastada aynı düzeyde olmayabilir; bazı hastalarda rijidite-akinezi baskın olabilir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Tanı", "q": "Tanı nasıl konur?", "a": "Nörolojik değerlendirme, aile öyküsü ve genetik test sonuçları birlikte ele alınır.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Seyir", "q": "Hastalığın seyri değişken midir?", "a": "Evet, başlangıç yaşı ve progresyon hızı bireyler arasında farklılık gösterebilir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Tedavi", "q": "Kesin tedavi var mı?", "a": "Şu an hastalığı durduran kesin tedavi yoktur; semptom odaklı yaklaşım uygulanır.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Tedavi", "q": "Motor belirtiler için ilaç seçenekleri var mı?", "a": "Bazı ilaçlar korea ve davranışsal belirtilerin yönetiminde klinik olarak kullanılabilir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Psikiyatri", "q": "Depresyon ve intihar riski neden yakından izlenir?", "a": "Psikiyatrik belirtiler hastalık yükünü artırabilir; erken tanı ve destek güvenlik açısından kritiktir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Beslenme", "q": "Kilo kaybı ve yutma sorunları nasıl yönetilir?", "a": "Beslenme danışmanlığı ve yutma değerlendirmesi aspirasyon riskini azaltmada önemlidir.", "l": "https://www.ninds.nih.gov/health-information/disorders/huntingtons-disease"},
+        {"c": "Bakım", "q": "Aile için bakım planı nasıl yapılır?", "a": "İşlevsel hedefler, davranış yönetimi ve bakım veren desteği birlikte planlanmalıdır.", "l": "https://hdsa.org/hdsa-helpline/"},
+        {"c": "Destek", "q": "HDSA helpline hangi konularda destek verir?", "a": "Semptom yönetimi, genetik test yönlendirmesi, yerel kaynaklar ve destek grupları için rehberlik sağlar.", "l": "https://hdsa.org/hdsa-helpline/"},
+        {"c": "Araştırma", "q": "Klinik araştırmalara katılım mümkün mü?", "a": "Uygun adaylar için klinik araştırma merkezleri ve resmi kayıt platformları takip edilmelidir.", "l": "https://clinicaltrials.gov"},
+        {"c": "Acil", "q": "Hangi durumda acil yardım gerekir?", "a": "Ciddi davranışsal kriz, intihar düşüncesi, yutma-solunum riski veya travmatik düşmelerde acil başvuru gerekir.", "l": "https://hdsa.org/hdsa-helpline/"},
+    ],
+    WORKSPACE_LEWY: [
+        {"c": "Temel", "q": "Lewy cisimcikli demans (LBD) nedir?", "a": "LBD, DLB ve Parkinson hastalığı demansını kapsayan, bilişsel ve motor belirtilerle seyreden bir demans grubudur.", "l": "https://www.lewybody.org/information-and-support/faqs/"},
+        {"c": "Tanı", "q": "DLB ile Parkinson demansı farkı nedir?", "a": "Kognitif belirtilerin motor bulgulara göre zamanlaması tanısal ayrımda temel yaklaşımdır.", "l": "https://www.lewybody.org/information-and-support/faqs/"},
+        {"c": "Belirti", "q": "En tipik belirtiler hangileridir?", "a": "Bilişsel dalgalanma, görsel halüsinasyon, parkinsonizm ve REM uyku davranış bozukluğu sık görülür.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "Belirti", "q": "Neden yanlış tanı sık olur?", "a": "LBD belirtileri Alzheimer ve Parkinson ile örtüşebildiği için erken dönemde karışabilir.", "l": "https://www.lewybody.org/information-and-support/faqs/"},
+        {"c": "Tanı", "q": "Kesin tanı için tek test var mı?", "a": "Hayır; tanı klinik özelliklerin birlikte değerlendirilmesiyle konur.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "Tedavi", "q": "LBD'nin küratif tedavisi var mı?", "a": "Şu anda kesin kür yoktur; semptom odaklı ve kişiselleştirilmiş tedavi uygulanır.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "İlaç", "q": "Antipsikotik duyarlılığı neden önemli?", "a": "Bazı ilaçlar LBD'de ciddi yan etki oluşturabileceğinden tedavi uzman gözetiminde yapılmalıdır.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "Uyku", "q": "REM uyku davranış bozukluğu nasıl ele alınır?", "a": "Uyku güvenliği ve medikal yaklaşım birlikte planlanmalı, düşme-travma riski azaltılmalıdır.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "Günlük Yaşam", "q": "Dalgalanan bilişsel durumla günlük plan nasıl yapılır?", "a": "Kısa görevler, düşük uyaranlı ortam ve düzenli rutinler işlevselliği artırabilir.", "l": "https://www.lbda.org"},
+        {"c": "Motor", "q": "Yürüme ve düşme riski nasıl yönetilir?", "a": "Fizyoterapi, çevre düzenlemesi ve ortostatik semptom takibi birlikte yapılmalıdır.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "Otonom", "q": "Tansiyon dalgalanması ve bayılma görülebilir mi?", "a": "Evet, otonom disfonksiyon LBD'de görülebilir ve düzenli değerlendirme gerektirir.", "l": "https://www.mayoclinic.org/diseases-conditions/lewy-body-dementia/diagnosis-treatment/drc-20352030"},
+        {"c": "Bakım", "q": "Bakım verenler için en önemli öncelikler nelerdir?", "a": "İlaç güvenliği, düşme önleme, uyku düzeni ve davranış yönetimi temel önceliklerdir.", "l": "https://www.lbda.org"},
+        {"c": "Destek", "q": "Hasta ve aile destek kaynakları nerede bulunur?", "a": "Lewy Body dernekleri ve demans destek hatları yönlendirme ve eğitim sağlar.", "l": "https://www.lewybody.org/information-and-support/faqs/"},
+        {"c": "Seyir", "q": "Hastalık zamanla kötüleşir mi?", "a": "LBD ilerleyici bir hastalıktır; semptomların şiddeti ve hızı bireye göre değişebilir.", "l": "https://www.lewybody.org/information-and-support/faqs/"},
+        {"c": "Acil", "q": "Hangi durumda acil başvuru yapılmalı?", "a": "Ani bilinç değişikliği, ciddi halüsinasyon krizi, düşme veya yutma-solunum sorunu varsa acil değerlendirme gerekir.", "l": "https://www.lbda.org"},
+    ],
+    WORKSPACE_FTD: [
+        {"c": "Temel", "q": "Frontotemporal demans (FTD) nedir?", "a": "FTD, frontal ve temporal beyin bölgelerini etkileyen, davranış ve dil değişiklikleriyle öne çıkan bir demans grubudur.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Belirti", "q": "FTD'nin en sık erken belirtileri nelerdir?", "a": "Davranış değişikliği, empati azalması, dürtüsellik veya dilde bozulma sık erken bulgulardır.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Belirti", "q": "FTD ile Alzheimer arasındaki temel fark nedir?", "a": "FTD'de başlangıçta bellekten çok davranış ve dil alanları daha belirgin etkilenebilir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Alt Tip", "q": "Pick hastalığı FTD ile aynı mıdır?", "a": "Pick hastalığı, FTD spektrumundaki belirli patolojik alt tiplerden biri olarak değerlendirilir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Genetik", "q": "FTD kalıtsal olabilir mi?", "a": "Evet, bazı FTD olguları ailesel geçiş gösterebilir; genetik danışmanlık uygun olabilir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Tanı", "q": "FTD tanısı nasıl konur?", "a": "Nörolojik değerlendirme, nöropsikolojik testler ve görüntüleme bulguları birlikte değerlendirilir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Tedavi", "q": "FTD için kesin tedavi var mı?", "a": "Şu an küratif tedavi yoktur; semptom yönetimi ve güvenlik odaklı bakım esastır.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Davranış", "q": "Dürtüsellik ve uygunsuz davranışlar nasıl yönetilir?", "a": "Yapılandırılmış rutin, çevresel sınırlar ve bakım veren eğitimi temel yaklaşımı oluşturur.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Dil", "q": "Dil bozukluğu olan FTD alt tiplerinde ne yapılır?", "a": "Konuşma-dil terapisi ve iletişim stratejileri günlük işlevi destekleyebilir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Güvenlik", "q": "Araç kullanımı ne zaman bırakılmalı?", "a": "Güvenlik riski geliştiğinde hekim değerlendirmesiyle araç kullanımı sonlandırılmalıdır.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Bakım", "q": "Aile bakım planı nasıl oluşturulur?", "a": "Davranış profili, günlük işlev kaybı ve bakım veren kapasitesi birlikte ele alınmalıdır.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Psikososyal", "q": "Bakım veren tükenmişliği nasıl azaltılır?", "a": "Mola bakımı, destek grupları ve profesyonel danışmanlık bakım yükünü azaltabilir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Seyir", "q": "Hastalık seyri öngörülebilir mi?", "a": "Seyir bireye göre değişkendir; düzenli izlem ve bakım planı güncellemesi gerekir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Destek", "q": "AFTD HelpLine hangi konularda yardımcı olur?", "a": "Alt tip bilgisi, yeni tanı yönetimi, kaynak yönlendirmesi ve duygusal destek sağlar.", "l": "https://www.theaftd.org/aftd-helpline/"},
+        {"c": "Acil", "q": "Ne zaman acil destek alınmalı?", "a": "Kendine-çevreye zarar riski, ciddi davranışsal kriz veya ani tıbbi kötüleşmede acil başvuru gerekir.", "l": "https://www.theaftd.org/aftd-helpline/"},
+    ],
+}
+def _workspace_filter_faq_items(
+    workspace_mode: str,
+    query: str = "",
+    category: str = "Tümü",
+) -> list[dict[str, str]]:
+    items = WORKSPACE_FAQ_DATA.get(workspace_mode, [])
+    q = str(query or "").strip().lower()
+    cat = str(category or "Tümü").strip()
+    out: list[dict[str, str]] = []
+    for it in items:
+        if not isinstance(it, dict):
+            continue
+        it_cat = str(it.get("c", "Genel") or "Genel")
+        if cat != "Tümü" and it_cat != cat:
+            continue
+        text_blob = f"{it.get('q', '')} {it.get('a', '')} {it_cat}".lower()
+        if q and q not in text_blob:
+            continue
+        out.append(it)
+    return out
+
+
+def _render_workspace_faq_page(workspace_mode: str) -> None:
+    st.subheader(f"{workspace_mode} | Sıkça Sorulan Sorular")
+    base_items = WORKSPACE_FAQ_DATA.get(workspace_mode, [])
+    categories = sorted({str(it.get("c", "Genel") or "Genel") for it in base_items if isinstance(it, dict)})
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        q = st.text_input("SSS içinde ara", "", key=f"ws_faq_search::{workspace_mode}")
+    with c2:
+        selected_category = st.selectbox(
+            "Kategori",
+            options=["Tümü"] + categories,
+            index=0,
+            key=f"ws_faq_category::{workspace_mode}",
+        )
+
+    faq_items = _workspace_filter_faq_items(workspace_mode, query=q, category=selected_category)
+    st.caption(f"Toplam sonuç: {len(faq_items)}")
+    if not faq_items:
+        st.info("Bu hastalık için filtreye uyan SSS kaydı bulunmuyor.")
+        return
+
+    for idx, item in enumerate(faq_items, start=1):
+        question = str(item.get("q", "")).strip()
+        answer = str(item.get("a", "")).strip()
+        category = str(item.get("c", "Genel") or "Genel").strip()
+        link = _safe_link(str(item.get("l", "")).strip())
+        title = f"{idx}. [{category}] {question or 'Soru'}"
+        with st.expander(title):
+            st.write(answer or "-")
+            if link != "#":
+                st.markdown(f"[Kaynak]({link})")
+
+def _workspace_history_records(workspace_mode: str) -> list[dict]:
+    hist_key = _neuro_history_state_key(workspace_mode)
+    hist = st.session_state.get(hist_key, [])
+    return hist if isinstance(hist, list) else []
+
+
+def _workspace_note_key(workspace_mode: str) -> str:
+    return f"{_active_patient_scope_key()}::{workspace_mode}"
+
+
+def _workspace_history_df(workspace_mode: str) -> pd.DataFrame:
+    hist = _workspace_history_records(workspace_mode)
+    return pd.DataFrame(hist) if hist else pd.DataFrame()
+
+
+def _workspace_latest_record(workspace_mode: str) -> dict:
+    hist = _workspace_history_records(workspace_mode)
+    if not hist:
+        return {}
+    return hist[-1] if isinstance(hist[-1], dict) else {}
+
+
+def _render_disease_workspace_dashboard(workspace_mode: str) -> None:
+    st.subheader(f"{workspace_mode} | Ana Panel")
+    _clinical_evidence_caption("Bilgilendirme", "Trend g?r?n?m? ?zet ama?l?d?r; klinik karar multidisipliner de?erlendirme ile verilmelidir.")
+    latest = _workspace_latest_record(workspace_mode)
+    hist = _workspace_history_records(workspace_mode)
+    pidx = float(latest.get("progression_index", 0.0) or 0.0)
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Son Progresyon İndeksi", f"{pidx:.1f} / 100")
+    c2.metric("Toplam Ölçüm", str(len(hist)))
+    c3.metric("Son Kayıt", str(latest.get("time", "-")))
+    if pidx >= 66:
+        st.error("Yüksek etkilenim düzeyi: yakın izlem önerilir.")
+    elif pidx >= 33:
+        st.warning("Orta etkilenim düzeyi: takip planı sıklaştırılmalı.")
+    else:
+        st.success("Düşük etkilenim düzeyi.")
+    df = _workspace_history_df(workspace_mode)
+    if not df.empty and "time" in df.columns and "progression_index" in df.columns:
+        if PLOTLY_OK:
+            fig = px.line(df, x="time", y="progression_index", markers=True, title=f"{workspace_mode} Progresyon Eğrisi")
+            fig.update_layout(height=320, xaxis_title="", yaxis_title="Progresyon İndeksi")
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.line_chart(df.set_index("time")[["progression_index"]], use_container_width=True)
+
+
+def _render_disease_workspace_calculator(workspace_mode: str) -> None:
+    handler = WORKSPACE_DASHBOARD_HANDLERS.get(workspace_mode)
+    if handler is not None:
+        _clinical_evidence_caption("Karar-Destek", "Skorlar izlem amaclidir; tedavi karari tek bir olcume dayandirilmamalidir.")
+        handler()
+        return
+
+    st.subheader(f"{workspace_mode} | Klinik Hesaplayıcı")
+    _ensure_neuro_dynamic_state(workspace_mode)
+    cfg = NEURO_DYNAMIC_CONFIG.get(workspace_mode, {})
+    fields = cfg.get("fields", [])
+    state_key = _neuro_input_state_key(workspace_mode)
+    state_vals = st.session_state.get(state_key, {})
+    cols = st.columns(len(fields)) if fields else []
+    for i, f in enumerate(fields):
+        with cols[i]:
+            k = str(f.get("key"))
+            vv = st.number_input(
+                str(f.get("label", k)),
+                min_value=float(f.get("min", 0)),
+                max_value=float(f.get("max", 100)),
+                value=float(state_vals.get(k, f.get("default", 0))),
+                key=f"calc::{_active_patient_scope_key()}::{workspace_mode}::{k}",
+            )
+            state_vals[k] = float(vv)
+    st.session_state[state_key] = state_vals
+    analiz = analiz_yap(workspace_mode, state_vals)
+    pidx = float(analiz.get("progression_index", 0.0))
+    st.metric("Hesaplanan Progresyon İndeksi", f"{pidx:.1f} / 100")
+    if st.button("Hesaplayıcı Ölçümünü Kaydet", key=f"save_calc::{workspace_mode}", use_container_width=True):
+        rec = {"time": datetime.now().strftime("%Y-%m-%d %H:%M"), "progression_index": pidx, **state_vals}
+        _save_neuro_history_record(workspace_mode, rec)
+        save_current_session_profile()
+        st.success("Kayıt eklendi.")
+
+
+def _render_disease_workspace_full_test(workspace_mode: str) -> None:
+    st.markdown(
+        f"<h3 style='text-align:center; margin-bottom: 8px;'>{workspace_mode} | Tam ?l?ekli Test</h3>",
+        unsafe_allow_html=True,
+    )
+    _clinical_evidence_caption(
+        "Karar-Destek",
+        "Bu b?l?mdeki skorlar izlem ama?l?d?r; tan? ve tedavi karar? tek ba??na bu testten verilmez.",
+    )
+
+    model = WORKSPACE_FULL_TEST_MODELS.get(workspace_mode, {})
+    items = model.get("items", [])
+    if not items:
+        st.info("Bu hastal?k i?in tam ?l?ekli test modeli tan?ml? de?il.")
+        return
+
+    scope = _active_patient_scope_key()
+    scores_key = f"fulltest::{scope}::{workspace_mode}"
+
+    min_defaults = [int(it.get("min", 0)) for it in items]
+    scores = st.session_state.get(scores_key, min_defaults)
+    if not isinstance(scores, list) or len(scores) != len(items):
+        scores = list(min_defaults)
+
+    c1, c2 = st.columns(2)
+    total = 0
+    max_total = 0
+    for i, it in enumerate(items):
+        label = str(it.get("label", f"Madde {i+1}"))
+        min_v = int(it.get("min", 0))
+        max_v = int(it.get("max", 4))
+        max_total += max_v
+        target_col = c1 if i % 2 == 0 else c2
+        with target_col:
+            st.markdown(f"**{i+1}. {label}**")
+            v = st.slider(
+                f"{workspace_mode}_test_{i}",
+                min_value=min_v,
+                max_value=max_v,
+                value=int(scores[i]),
+                key=f"fulltest_slider::{scope}::{workspace_mode}::{i}",
+                label_visibility="collapsed",
+            )
+            scores[i] = int(v)
+            total += int(v)
+
+    st.session_state[scores_key] = scores
+    max_total = max(1, int(max_total))
+
+    higher_is_better = bool(model.get("higher_is_better", True))
+    raw_pct = (float(total) / float(max_total)) * 100.0
+    burden_pct = (100.0 - raw_pct) if higher_is_better else raw_pct
+    burden_pct = max(0.0, min(100.0, burden_pct))
+
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Test Toplam", f"{total} / {max_total}")
+    m2.metric("Klinik Y?k", f"{burden_pct:.1f} / 100")
+    m3.metric("Test Modeli", str(model.get("name", "-")))
+
+    st.progress(min(1.0, max(0.0, burden_pct / 100.0)))
+
+    sev, sev_msg = _workspace_full_test_interpretation(workspace_mode, burden_pct)
+    if sev == "high":
+        st.error(sev_msg)
+    elif sev == "mid":
+        st.warning(sev_msg)
+    else:
+        st.success(sev_msg)
+
+    personalize_key = f"fulltest_personalize::{scope}::{workspace_mode}"
+    personalize_followup = st.checkbox(
+        "Takip aral???n? bireyselle?tir (risk parametrelerine g?re)",
+        value=True,
+        key=personalize_key,
+    )
+    plan = _workspace_next_control_plan_personalized(workspace_mode, sev, enabled=bool(personalize_followup))
+    st.info(f"?nerilen bir sonraki kontrol: {plan.get('interval', '3 ay')} i?inde.")
+    _clinical_evidence_caption(plan.get("evidence", "Bilgilendirme"), plan.get("basis", ""))
+
+    if PLOTLY_OK:
+        df_items = pd.DataFrame(
+            [
+                {
+                    "item": str(items[idx].get("label", idx + 1)),
+                    "score": float(scores[idx]),
+                    "max": float(items[idx].get("max", 4)),
+                }
+                for idx in range(len(items))
+            ]
+        )
+        if not df_items.empty:
+            df_items["ratio"] = (df_items["score"] / df_items["max"]).fillna(0.0)
+            fig = px.bar(
+                df_items,
+                x="item",
+                y="score",
+                color="ratio",
+                color_continuous_scale="RdYlGn" if higher_is_better else "RdYlGn_r",
+                title=f"{workspace_mode} Tam ?l?ekli Test Da??l?m?",
+            )
+            fig.update_layout(height=340, xaxis_title="", yaxis_title="Skor")
+            st.plotly_chart(fig, use_container_width=True)
+
+    if st.button("Tam ?l?ekli Testi Kaydet", key=f"save_fulltest::{workspace_mode}", use_container_width=True):
+        rec = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "full_test_name": str(model.get("name", "custom")),
+            "full_test_total": float(total),
+            "full_test_pct": float(round(raw_pct, 2)),
+            "progression_index": float(round(burden_pct, 2)),
+            "full_test_items": list(scores),
+            "full_test_item_labels": [str(it.get("label", "")) for it in items],
+        }
+        _save_neuro_history_record(workspace_mode, rec)
+        save_current_session_profile()
+        st.success("Tam ?l?ekli test kaydedildi.")
+
+
+def _render_disease_workspace_ops(workspace_mode: str) -> None:
+    st.subheader(f"{workspace_mode} | Klinik Operasyon Merkezi")
+    df = _workspace_history_df(workspace_mode)
+    if df.empty:
+        st.info("Hen?z operasyon kayd? bulunmuyor.")
+        return
+    st.dataframe(df.tail(30), use_container_width=True, hide_index=True)
+    out = io.StringIO()
+    df.tail(200).to_csv(out, index=False)
+    st.download_button(
+        "Kay?tlar? CSV ?ndir",
+        data=out.getvalue().encode("utf-8"),
+        file_name=f"{workspace_mode.lower().replace(' ', '_')}_records.csv",
+        mime="text/csv",
+        use_container_width=True,
+    )
+
+
+def _render_disease_workspace_calendar(workspace_mode: str) -> None:
+    st.subheader(f"{workspace_mode} | Klinik Takvim & Haklar")
+    with st.form(f"ws_reminder_form::{workspace_mode}", clear_on_submit=True):
+        rd = st.date_input("Tarih", key=f"ws_reminder_date::{workspace_mode}")
+        rt = st.text_input("Ba?l?k", key=f"ws_reminder_title::{workspace_mode}")
+        rn = st.text_input("Not", key=f"ws_reminder_note::{workspace_mode}")
+        ok = st.form_submit_button("Randevu Ekle")
+        if ok and rt.strip():
+            arr = st.session_state.get("reminders", [])
+            if not isinstance(arr, list):
+                arr = []
+            arr.append({"date": str(rd), "title": f"[{workspace_mode}] {rt.strip()}", "note": rn.strip()})
+            st.session_state["reminders"] = arr
+            save_current_session_profile()
+            st.success("Randevu eklendi.")
+    ws_rem = [r for r in st.session_state.get("reminders", []) if f"[{workspace_mode}]" in str(r.get("title", ""))]
+    if ws_rem:
+        st.dataframe(pd.DataFrame(ws_rem).tail(20), use_container_width=True, hide_index=True)
+    else:
+        st.info("Bu hastal?k i?in randevu kayd? yok.")
+
+
+def _render_disease_workspace_emergency(workspace_mode: str) -> None:
+    st.subheader(f"{workspace_mode} | Acil Durum & Kritik Bak?m")
+    _clinical_evidence_caption("Acil Uyar?", "Bu b?l?m acil triyaj hat?rlat?c?s?d?r; lokal acil protokoller ve hekim de?erlendirmesi esast?r.")
+    alerts = {
+        WORKSPACE_ALS: ["Ani solunum s?k?nt?s?", "Sekresyon temizleyememe", "H?zl? bulber k?t?le?me"],
+        WORKSPACE_ALZHEIMER: ["Ani bilin? de?i?ikli?i", "Yeni n?rolojik defisit", "?iddetli ajitasyon/dehidratasyon"],
+        WORKSPACE_PARKINSON: ["Ani donakalma/d??me", "Aspirasyon riski", "?la? kesintisine ba?l? k?t?le?me"],
+        WORKSPACE_HUNTINGTON: ["Yutma bozuklu?u ve aspirasyon", "Ciddi davran??sal kriz", "H?zl? fonksiyon kayb?"],
+        WORKSPACE_LEWY: ["?iddetli hal?sinasyon-konf?zyon", "D??me/senkop", "Ani mobilite kayb?"],
+        WORKSPACE_FTD: ["Tehlikeli davran??sal dezorganizasyon", "Beslenme/hidrasyon bozulmas?", "Bak?m veren g?venlik riski"],
+        WORKSPACE_SMA: ["Solunum efor art???", "Sekresyon retansiyonu", "Ani g?? kayb?"],
+    }
+    for a in alerts.get(workspace_mode, []):
+        st.error(f"- {a}")
+
+
+def _render_disease_workspace_vision(workspace_mode: str) -> None:
+    st.markdown(
+        f"<h3 style='text-align:center; margin-bottom: 8px;'>{workspace_mode} | Vizyon</h3>",
+        unsafe_allow_html=True,
+    )
+
+    vision_map = {
+        WORKSPACE_ALS: {
+            "mission": "ALS bak?m?nda fonksiyonel kayb? erken yakalay?p solunum odakl? riskleri daha ?nce g?r?n?r k?lmak.",
+            "pillars": [
+                "ALSFRS-R ve solunum trendlerinin tek panelde birle?tirilmesi",
+                "Bulber ve sekresyon riskinde erken alarm mekanizmas?",
+                "Bak?m veren y?k?n? azaltan sade takip ak???",
+            ],
+        },
+        WORKSPACE_ALZHEIMER: {
+            "mission": "Bili?sel gerilemeyi sadece skorla de?il g?nl?k ya?am etkisiyle birlikte izleyen etik bir dijital klinik ak??? kurmak.",
+            "pillars": [
+                "MMSE/MoCA + ADL birlikteli?i ile evreye duyarl? takip",
+                "Davran??sal belirtiler i?in g?venlik odakl? planlama",
+                "Aile ve bak?m veren ileti?imi i?in standart raporlama",
+            ],
+        },
+        WORKSPACE_PARKINSON: {
+            "mission": "Motor semptom, d??me riski ve tedavi zamanlamas?n? tek bir klinik ritimde y?netmek.",
+            "pillars": [
+                "UPDRS ve denge metrikleriyle progresyon izleme",
+                "D??me ?nleme odakl? erken m?dahale i?aretleri",
+                "Fonksiyon kayb?n? geciktirmeye y?nelik multidisipliner plan",
+            ],
+        },
+        WORKSPACE_HUNTINGTON: {
+            "mission": "Motor, kognitif ve fonksiyonel de?i?imi birlikte de?erlendiren s?rekli ve ?zenli bir takip modeli sunmak.",
+            "pillars": [
+                "UHDRS/TFC ekseninde progresyonun sade g?r?n?m?",
+                "G?venlik ve ba??ms?zl?k hedeflerinin erken g?ncellenmesi",
+                "Aile ile uzun d?nem bak?m plan?n?n e?it zamanl? y?netimi",
+            ],
+        },
+        WORKSPACE_LEWY: {
+            "mission": "Dalgalanma ve hal?sinasyon a??rl???n? g?venlik odakl? ?ekilde erken fark eden bir klinik koordinasyon sistemi kurmak.",
+            "pillars": [
+                "Core semptomlar?n d?zenli ve yap?sal takibi",
+                "Geceleri artan riskler i?in erken uyar? modeli",
+                "N?ro-psikiyatrik ve motor izlemi tek ?at? alt?nda toplamak",
+            ],
+        },
+        WORKSPACE_FTD: {
+            "mission": "Davran??sal ve dil bozukluklar?n? bak?m veren g?venli?i ile birlikte izleyen insan-merkezli bir sistem geli?tirmek.",
+            "pillars": [
+                "Davran??sal y?k ve ADL kayb?n?n birlikte takibi",
+                "Dil alt tiplerinde hedefli izlem notasyonu",
+                "Bak?m veren t?keni?ini azaltan pratik klinik aksiyonlar",
+            ],
+        },
+        WORKSPACE_SMA: {
+            "mission": "Motor performans ve solunum kapasitesini ?ocuk-ergen-eri?kin s?re?lerinde tutarl? bir kaliteyle izlemek.",
+            "pillars": [
+                "HFMSE/RULM/FVC trendlerinin ortak klinik paneli",
+                "Tedavi yan?t? ve fonksiyon korunumu i?in erken fark sinyalleri",
+                "Rehabilitasyon ve solunum plan?n?n d?nemsel optimizasyonu",
+            ],
+        },
+    }
+
+    data = vision_map.get(
+        workspace_mode,
+        {
+            "mission": "N?ro-dejeneratif hastal?klarda klinik kalite, veri b?t?nl??? ve hasta g?venli?ini birlikte y?kselten bir platform geli?tirmek.",
+            "pillars": [
+                "Risk odakl? izlem",
+                "Yap?sal klinik raporlama",
+                "Multidisipliner karar deste?i",
+            ],
+        },
+    )
+
+    st.markdown(
+        f"""
+        <div style="background: linear-gradient(135deg, #0ea5e9 0%, #22c55e 100%); padding: 22px; border-radius: 16px; color: white; margin-bottom: 16px; text-align:center;">
+            <h3 style="margin:0 0 8px 0;">Klinik Vizyon</h3>
+            <p style="margin:0; opacity:0.95;">{data.get('mission','')}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("<h4 style='text-align:center;'>Stratejik Odaklar</h4>", unsafe_allow_html=True)
+    for ptxt in data.get("pillars", []):
+        st.write(f"- {ptxt}")
+
+    target_map = {
+        WORKSPACE_ALS: [
+            {"label": "ALSFRS-R y?ll?k d????", "target": "<= 6 puan/y?l", "key": "alsfrs_r", "op": "le", "thr": 6.0},
+            {"label": "FVC korunumu", "target": ">= %70", "key": "fvc_pct", "op": "ge", "thr": 70.0},
+            {"label": "Acil solunum ba?vurusu", "target": "<= 1/y?l", "key": ""},
+        ],
+        WORKSPACE_ALZHEIMER: [
+            {"label": "MMSE korunumu", "target": ">= 18", "key": "mmse", "op": "ge", "thr": 18.0},
+            {"label": "ADL ba??ms?zl?k", "target": ">= %60", "key": "adl_independence", "op": "ge", "thr": 60.0},
+            {"label": "Bak?m krizi ba?vurusu", "target": "<= 1/y?l", "key": ""},
+        ],
+        WORKSPACE_PARKINSON: [
+            {"label": "UPDRS toplam", "target": "<= 40", "key": "updrs_total", "op": "le", "thr": 40.0},
+            {"label": "Ayl?k d??me say?s?", "target": "<= 1", "key": "falls_month", "op": "le", "thr": 1.0},
+            {"label": "TUG", "target": "< 13.5 sn", "key": "tug_sec", "op": "lt", "thr": 13.5},
+        ],
+        WORKSPACE_HUNTINGTON: [
+            {"label": "UHDRS motor", "target": "<= 40", "key": "uhdrs_motor", "op": "le", "thr": 40.0},
+            {"label": "TFC korunumu", "target": ">= 7", "key": "tfc", "op": "ge", "thr": 7.0},
+            {"label": "Acil davran??sal kriz", "target": "<= 1/y?l", "key": ""},
+        ],
+        WORKSPACE_LEWY: [
+            {"label": "MMSE korunumu", "target": ">= 18", "key": "mmse", "op": "ge", "thr": 18.0},
+            {"label": "Hal?sinasyon y?k?", "target": "<= 4", "key": "hallucination", "op": "le", "thr": 4.0},
+            {"label": "G?venlik olay?", "target": "<= 1/y?l", "key": ""},
+        ],
+        WORKSPACE_FTD: [
+            {"label": "FBI seviyesi", "target": "<= 30", "key": "fbi", "op": "le", "thr": 30.0},
+            {"label": "ADL kay?p seviyesi", "target": "<= 5", "key": "adl_loss", "op": "le", "thr": 5.0},
+            {"label": "Bak?m veren risk olay?", "target": "<= 1/y?l", "key": ""},
+        ],
+        WORKSPACE_SMA: [
+            {"label": "HFMSE korunumu", "target": ">= 30", "key": "hfmse", "op": "ge", "thr": 30.0},
+            {"label": "RULM korunumu", "target": ">= 20", "key": "rulm", "op": "ge", "thr": 20.0},
+            {"label": "FVC korunumu", "target": ">= %70", "key": "fvc_pct", "op": "ge", "thr": 70.0},
+        ],
+    }
+
+    st.markdown("<h4 style='text-align:center;'>2026 Hedef Metrikleri</h4>", unsafe_allow_html=True)
+    latest = _workspace_latest_record(workspace_mode)
+    goals = target_map.get(workspace_mode, [])
+    if goals:
+        gcols = st.columns(len(goals))
+        for i, g in enumerate(goals):
+            k = str(g.get("key", "")).strip()
+            cur = "-"
+            if k and isinstance(latest, dict) and k in latest:
+                try:
+                    val = float(latest.get(k))
+                    cur = f"{val:.1f}"
+                except Exception:
+                    cur = str(latest.get(k))
+            op = str(g.get("op", "")).strip().lower()
+            thr = g.get("thr", None)
+            status = "Bilgi yok"
+            status_color = "#64748b"
+            if cur != "-" and op and isinstance(thr, (int, float)):
+                try:
+                    vcur = float(cur)
+                    vthr = float(thr)
+                    if op == "ge":
+                        if vcur >= vthr:
+                            status, status_color = "Hedefe Uygun", "#16a34a"
+                        elif vcur >= (0.9 * vthr):
+                            status, status_color = "Dikkat", "#d97706"
+                        else:
+                            status, status_color = "Kritik", "#dc2626"
+                    elif op == "le":
+                        if vcur <= vthr:
+                            status, status_color = "Hedefe Uygun", "#16a34a"
+                        elif vcur <= (1.25 * vthr):
+                            status, status_color = "Dikkat", "#d97706"
+                        else:
+                            status, status_color = "Kritik", "#dc2626"
+                    elif op == "lt":
+                        if vcur < vthr:
+                            status, status_color = "Hedefe Uygun", "#16a34a"
+                        elif vcur <= (1.15 * vthr):
+                            status, status_color = "Dikkat", "#d97706"
+                        else:
+                            status, status_color = "Kritik", "#dc2626"
+                except Exception:
+                    status, status_color = "Bilgi yok", "#64748b"
+
+            with gcols[i]:
+                st.metric(str(g.get("label", "Hedef")), cur)
+                st.markdown(f"<div style='text-align:center; font-size:0.85rem; color:#64748b;'>Hedef: {g.get('target', '-')}</div>", unsafe_allow_html=True)
+                st.markdown(f"<div style='text-align:center; font-size:0.85rem; color:{status_color};'><b>Durum:</b> {status}</div>", unsafe_allow_html=True)
+    else:
+        st.info("Bu hastal?k i?in hedef metrik seti tan?ml? de?il.")
+
+    _clinical_evidence_caption(
+        "Bilgilendirme",
+        "Vizyon sayfas? ?r?n y?n? ve klinik kalite hedeflerini ?zetler; tan?/tedavi karar? yerine ge?mez.",
+    )
+
+
+def _render_disease_workspace_page(workspace_mode: str, page_label: str) -> None:
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[0]:
+        _render_disease_workspace_dashboard(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[1]:
+        _render_disease_workspace_calculator(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[2]:
+        _render_disease_workspace_full_test(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[3]:
+        _render_disease_workspace_ops(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[4]:
+        _render_disease_workspace_calendar(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[5]:
+        _render_disease_workspace_emergency(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[6]:
+        _render_workspace_faq_page(workspace_mode)
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[7]:
+        st.subheader(f"{workspace_mode} | Güncel Haberler")
+        st.caption("Kaynak: Google News RSS. Başlıklara tıklayarak haberin tamamını açabilirsiniz.")
+
+        lang_v = st.session_state.get("lang", "TR")
+        query = WORKSPACE_NEWS_QUERY.get(workspace_mode, workspace_mode)
+
+        c_news1, c_news2 = st.columns([1, 1])
+        with c_news1:
+            if st.button("Haberleri Yenile", key=f"ws_news_refresh::{workspace_mode}", use_container_width=True):
+                fetch_disease_news.clear()
+                st.rerun()
+        with c_news2:
+            all_news_url = (
+                "https://news.google.com/search?q="
+                + quote_plus(query)
+                + ("&hl=en-US&gl=US&ceid=US:en" if lang_v == "EN" else "&hl=tr&gl=TR&ceid=TR:tr")
+            )
+            st.link_button("Tüm Haberleri Google News'te Gör", all_news_url, use_container_width=True)
+
+        raw_news_items = fetch_disease_news(query, lang=lang_v, limit=25)
+        news_items = list(raw_news_items)
+
+        key_filter = st.text_input("Haber içinde ara", value="", key=f"ws_news_search::{workspace_mode}").strip().lower()
+        sources = sorted({n.get("source", "Google News") for n in news_items}) if news_items else []
+        source_pick = st.selectbox("Kaynak filtresi", ["Tümü"] + sources, index=0, key=f"ws_news_source::{workspace_mode}")
+
+        if news_items:
+            news_items = [
+                n for n in news_items
+                if (not key_filter or key_filter in str(n.get("title", "")).lower())
+                and (source_pick == "Tümü" or str(n.get("source", "")) == source_pick)
+            ]
+
+        if not raw_news_items:
+            st.info("Haber akışı şu anda boş. Daha sonra tekrar deneyin.")
+        elif not news_items:
+            st.info("Filtrelere uygun haber bulunamadı. Arama ifadesini veya kaynak filtresini değiştirin.")
+        else:
+            for i, item in enumerate(news_items, start=1):
+                title = html.escape(item.get("title", "Haber"))
+                link = _safe_link(item.get("link", "#"))
+                source = html.escape(str(item.get("source", "Google News")))
+                published = html.escape(str(item.get("published", "")))
+                st.markdown(f"{i}. **{title}**")
+                meta_parts = [f"Kaynak: {source}"]
+                if published:
+                    meta_parts.append(f"Tarih: {published}")
+                st.caption(" | ".join(meta_parts))
+                if link != "#":
+                    st.markdown(f"[Haberi Aç]({link})")
+                st.markdown("---")
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[8]:
+        st.subheader(f"{workspace_mode} | AI Yardım")
+        _render_ai_key_settings(scope_key=f"workspace::{workspace_mode}")
+        q = st.text_area("Sorunuz", placeholder=f"{workspace_mode} ile ilgili klinik soruyu yazın...", key=f"ai_q::{workspace_mode}")
+        if st.button("AI Yanıtı Oluştur", key=f"ai_btn::{workspace_mode}", use_container_width=True):
+            q_clean = str(q or "").strip()
+            if not q_clean:
+                st.error("Lütfen bir soru yazın.")
+            elif not _get_openai_api_key():
+                st.error("OpenAI API anahtarı bulunamadı. AI Ayarları bölümünden anahtar girin.")
+            else:
+                context = f"Çalışma alanı: {workspace_mode}\nHasta: {_active_patient_scope_key()}"
+                ans = ask_openai_medical_assistant(q_clean, context_text=context)
+                st.markdown(f"**Yanıt:** {ans}")
+        return
+
+    if page_label == DISEASE_WORKSPACE_NAV_PAGES[9]:
+        _render_disease_workspace_vision(workspace_mode)
+        return
+
+
+    st.warning("Geçersiz sayfa seçimi.")
 
 # --- SIDEBAR TASARIMI (UI/UX) ---   TEK SIDEBAR BLOĞU + AÇIK TEMA
 with st.sidebar:
@@ -3751,6 +6293,19 @@ with st.sidebar:
 
     st.markdown("---")
     st.title("NIZEN")
+    selected_workspace = st.selectbox(
+        "Çalışma Alanı Seçin",
+        options=WORKSPACE_OPTIONS,
+        index=(
+            WORKSPACE_OPTIONS.index(
+                st.session_state.get("workspace_mode", WORKSPACE_DMD)
+            )
+            if st.session_state.get("workspace_mode", WORKSPACE_DMD) in WORKSPACE_OPTIONS
+            else 0
+        ),
+        key="workspace_mode_select",
+    )
+    st.session_state["workspace_mode"] = selected_workspace
 
     # NIZEN Brand Card (light-only)
     st.markdown(
@@ -3840,9 +6395,13 @@ with st.sidebar:
             _add_audit("patient_switch_sidebar", selected_pid)
             st.rerun()
 
-    visible_pages = _role_page_labels(D, st.session_state.get("user_role", "family"))
-    default_page = visible_pages[0] if visible_pages else D["nav"][0]
-    page_options = visible_pages if visible_pages else [default_page]
+    if selected_workspace == WORKSPACE_DMD:
+        visible_pages = _role_page_labels(D, st.session_state.get("user_role", "family"))
+        default_page = visible_pages[0] if visible_pages else D["nav"][0]
+        page_options = visible_pages if visible_pages else [default_page]
+    else:
+        default_page = DISEASE_WORKSPACE_NAV_PAGES[0]
+        page_options = list(DISEASE_WORKSPACE_NAV_PAGES)
     prev_page = st.session_state.get("selected_page", default_page)
     if prev_page not in page_options:
         prev_page = default_page
@@ -4007,6 +6566,11 @@ st.markdown(
 )
 st.markdown('<div class="header-line"></div>', unsafe_allow_html=True)
 
+workspace_mode = st.session_state.get("workspace_mode", WORKSPACE_DMD)
+if workspace_mode != WORKSPACE_DMD:
+    _render_disease_workspace_page(workspace_mode, page)
+    st.stop()
+
 # --- SAYFA 0: ANA PANEL (DASHBOARD) ---
 if page == D['nav'][PAGE_DASHBOARD]:
     # --- NEW/UPDATED --- Researcher rolunde sadece anonim ozet
@@ -4115,11 +6679,11 @@ if page == D['nav'][PAGE_DASHBOARD]:
                 per_year = 0.0
 
             if delta < 0:
-                direction = "⬇️ Declining"
+                direction = "⬇ Declining"
             elif delta > 0:
-                direction = "⬆️ Improving"
+                direction = "⬆ Improving"
             else:
-                direction = "➡️ Stable"
+                direction = " Stable"
 
             if per_year <= -4:
                 risk = "HIGH"
@@ -4145,21 +6709,21 @@ if page == D['nav'][PAGE_DASHBOARD]:
 
     try:
         if delta <= -3:
-            alerts.append("⚠️ NSAA düşüşü tespit edildi.")
+            alerts.append(" NSAA düşüşü tespit edildi.")
     except Exception:
         pass
 
     try:
         ef = mp.get("ef")
         if str(ef).strip() != "" and int(float(ef)) < 55:
-            alerts.append("❤️ EF düşük olabilir (kardiyak kontrol önerilir).")
+            alerts.append(" EF düşük olabilir (kardiyak kontrol önerilir).")
     except Exception:
         pass
 
     try:
         fvc = mp.get("fvc")
         if str(fvc).strip() != "" and int(float(fvc)) < 80:
-            alerts.append("🫁 FVC düşük olabilir (solunum değerlendirmesi önerilir).")
+            alerts.append(" FVC düşük olabilir (solunum değerlendirmesi önerilir).")
     except Exception:
         pass
 
@@ -4167,7 +6731,7 @@ if page == D['nav'][PAGE_DASHBOARD]:
         for a in alerts:
             st.warning(a)
     else:
-        st.success("✅ Kritik uyarı yok")
+        st.success(" Kritik uyarı yok")
 
     # --- HASTA ÖZET KARTI (HTML yerine native Streamlit; kod metni görünmesini engeller) ---
     st.subheader("Mevcut Klinik Profil Özeti")
@@ -4304,6 +6868,10 @@ if page == D['nav'][PAGE_DASHBOARD]:
 
 # --- SAYFA 1: KLİNİK HESAPLAYICI (PREMIUM KARAR DESTEK SİSTEMİ) ---
 elif page == D['nav'][PAGE_CALCULATOR]:
+    st.markdown("### DMD Genetik Modül")
+    dmd_dashboard()
+    st.divider()
+
     st.markdown(f"""
         <div style="background: linear-gradient(135deg, #1c83e1 0%, #155ea1 100%); padding: 30px; border-radius: 20px; text-align: center; color: white; margin-bottom: 30px;">
             <h1 style="margin: 0; font-size: 2.5rem;">{D['calc_h']}</h1>
@@ -4485,7 +7053,7 @@ elif page == D['nav'][PAGE_CALCULATOR]:
             )
             hedefler = st.multiselect(
                 "Öncelikli hedefler",
-                ["Yürüme dayanıklılığı", "Üst ekstremite fonksiyonu", "Solunum egzersizi", "Postür/skolyoz takibi", "Okul/iş uyumu", "Psikososyal destek"],
+                ["Yürüme dayanıklılığı", "Üst ekstremite fonksiyonu", "Solunum egzersizi", "Postür/skolyoz takibi", "Okul/iş uyumu", "Ps?kososyal destek"],
                 default=cp.get("goals", []),
             )
 
@@ -4710,15 +7278,15 @@ elif page == D['nav'][PAGE_FAQ]:
         </div>
     """, unsafe_allow_html=True)
 
-    # Arama ve Filtreleme Alanı
-    faq_search = st.text_input(" Bilgi Bankasında Arayın (Örn: Ekzon, Steroid, Fizik Tedavi...)", "").lower()
+    # Arama + kategori filtresi (workspace SSS formatı ile uyumlu)
+    faq_search = st.text_input("SSS içinde ara", "", key="dmd_faq_search").strip().lower()
 
     # --- GENİŞLETİLMİŞ VERİ SETİ ---
     faq_data = [
         {
             "cat": " GENETİK VE TEŞHİS",
             "q": "DMD ve BMD Arasındaki Fark Nedir",
-            "a": "DMD (Duchenne), distrofin proteininin tamamen eksik olduğu daha ağır seyreden tiptir. BMD (Becker) ise proteinin az veya kusurlu olduğu, semptomların daha geç ve hafif başladığı formdur.",
+            "a": "DMD (Duchenne), distrofin proteininin tamamen eks?k olduğu daha ağır seyreden tiptir. BMD (Becker) ise proteinin az veya kusurlu olduğu, semptomların daha geç ve hafif başladığı formdur.",
             "l": "https://mda.org",
             "tag": "Genetik"
         },
@@ -4739,7 +7307,7 @@ elif page == D['nav'][PAGE_FAQ]:
         {
             "cat": " SOLUNUM VE KALP",
             "q": "Kardiyak Takip Neden Erken Başlamalıdır",
-            "a": "DMD hastalarında kalp kası (miyokard) distrofin eksikliğinden etkilenir. Belirti olmasa dahi 10 yaşından önce ACE inhibitörleri gibi koruyucu tedavilere başlamak hayati olabilir.",
+            "a": "DMD hastalarında kalp kası (miyokard) distrofin eks?kliğinden etkilenir. Belirti olmasa dahi 10 yaşından önce ACE inhibitörleri gibi koruyucu tedavilere başlamak hayati olabilir.",
             "l": "https://worldduchenne.org",
             "tag": "Kritik"
         },
@@ -4850,26 +7418,40 @@ elif page == D['nav'][PAGE_FAQ]:
         }
     ]
 
-    # --- FİLTRELEME VE GÖSTERİM MANTIĞI ---
-    filtered_faq = [item for item in faq_data if faq_search in item['q'].lower() or faq_search in item['a'].lower()]
+    categories = sorted({str(item.get("cat", "Genel")).strip() for item in faq_data if isinstance(item, dict)})
+    _, c_faq_2 = st.columns([2, 1])
+    with c_faq_2:
+        selected_category = st.selectbox(
+            "Kategori",
+            options=["Tümü"] + categories,
+            index=0,
+            key="dmd_faq_category",
+        )
+
+    def _match_dmd_faq(item: dict, query: str, category: str) -> bool:
+        cat = str(item.get("cat", "Genel")).strip()
+        if category != "Tümü" and cat != category:
+            return False
+        blob = f"{item.get('q', '')} {item.get('a', '')} {cat}".lower()
+        return (not query) or (query in blob)
+
+    filtered_faq = [item for item in faq_data if isinstance(item, dict) and _match_dmd_faq(item, faq_search, selected_category)]
+
+    st.caption("Kaynak standardı: Her madde resmi kurum/dernek veya klinik rehber bağlantısı içerir.")
+    st.caption(f"Toplam sonuç: {len(filtered_faq)}")
 
     if not filtered_faq:
-        st.warning("Aradığınız kriterlere uygun bilgi bulunamadı. Lütfen farklı kelimeler deneyin.")
-    
-    for item in filtered_faq:
-        with st.expander(f"{item['cat']} | {item['q']}"):
-            st.markdown(f"""
-                <div style="padding: 10px; border-left: 3px solid #1c83e1; background: #f9f9f9; border-radius: 0 10px 10px 0;">
-                    <p style="font-size: 1.05rem; line-height: 1.6; color: #333;">{item['a']}</p>
-                </div>
-            """, unsafe_allow_html=True)
-            
-            # Alt Bilgi Satırı
-            c1, c2 = st.columns([4, 1])
-            with c1:
-                st.markdown(f"[Akademik Kaynağa Git]({item['l']})")
-            with c2:
-                st.markdown(f"<p style='text-align:right;'><small style='background:#1c83e1; color:white; padding:3px 8px; border-radius:5px;'>{item['tag']}</small></p>", unsafe_allow_html=True)
+        st.info("Filtreye uyan SSS kaydı bulunamadı.")
+
+    for idx, item in enumerate(filtered_faq, start=1):
+        category = str(item.get("cat", "Genel")).strip()
+        question = str(item.get("q", "")).strip()
+        answer = str(item.get("a", "")).strip()
+        link = _safe_link(str(item.get("l", "")).strip())
+        with st.expander(f"{idx}. [{category}] {question or 'Soru'}"):
+            st.write(answer or "-")
+            if link != "#":
+                st.markdown(f"[Kaynak]({link})")
 
     st.markdown("<br><br>", unsafe_allow_html=True)
     
@@ -4889,7 +7471,7 @@ elif page == D['nav'][PAGE_EMERGENCY]:
     st.title(D['emer_h'])
     
     # Doktorlar için hızlı uyarı kartı
-    st.warning("**Tıbbi Personel İçin Özet:** Bu hasta Distrofin eksikliği (DMD) tanılıdır. Standart anestezi protokolleri ölümcül olabilir.")
+    st.warning("**Tıbbi Personel İçin Özet:** Bu hasta Distrofin eks?kliği (DMD) tanılıdır. Succinylcholine kaçınılmalı, volatil ajanlar dikkatle değerlendirilmelidir.")
 
     # Acil Servis Butonu ve Genişletilmiş Görünüm
     if st.button("ACİL SERVİS: DOKTORA GÖSTER (TAM EKRAN)"):
@@ -4899,7 +7481,7 @@ elif page == D['nav'][PAGE_EMERGENCY]:
                 <h2 style="color:white; border-bottom: 2px solid white; padding-bottom:15px;">HASTA DMD (DUCHENNE) TANILIDIR</h2>
                 <div style="text-align:left; color:white; font-size:24px; margin-top:20px; line-height:1.6;">
                     <p><b>1. ANESTEZİ:</b> SÜKSİNİLKOLİN VE TÜM GAZLAR (İnhalanlar) <b>KESİNLİKLE YASAK!</b> Sadece TIVA (Propofol vb.) kullanılabilir.</p>
-                    <p><b>2. OKSİJEN:</b> Hedef %92-95. Kontrolsüz yüksek oksijen solunum durmasına yol açabilir!</p>
+                    <p><b>2. SOLUNUM DESTEĞİ:</b> Oksijen gereksinimi ventilasyon ve CO2 izlemi ile birlikte değerlendirilmelidir; oksijenin tek başına verilmesi hipoventilasyonu maskeleyebilir.</p>
                     <p><b>3. KALP:</b> Kardiyomiyopati riski nedeniyle EKG ve Troponin takibi yapılmalıdır.</p>
                     <p><b>4. STEROİD:</b> Düzenli steroid alıyorsa, stres dozu (hidrokortizon) gerekebilir.</p>
                 </div>
@@ -5003,8 +7585,8 @@ elif page == D['nav'][PAGE_CALENDAR]:
         
         with st.expander(" Eğitim ve RAM Destekleri"):
             st.write("Rehabilitasyon merkezlerinde haftalık seans desteği ve okulda 'BEP' (Bireyselleştirilmiş Eğitim Planı) hakkınız mevcuttur.")
-        with st.expander(" Psikososyal Destek ve Bakım Veren Desteği"):
-            st.write("- **Psikolojik destek:** Uzun dönem bakım yükü için aile ve birey odaklı danışmanlık planlanabilir.")
+        with st.expander(" Ps?kososyal Destek ve Bakım Veren Desteği"):
+            st.write("- **Ps?kolojik destek:** Uzun dönem bakım yükü için aile ve birey odaklı danışmanlık planlanabilir.")
             st.write("- **Okul/iş uyumu:** Eğitim kurumu ile bireyselleştirilmiş uyum planı yapılmalıdır.")
             st.write("- **Bakım veren tükenmişliği:** Düzenli mola planı ve sosyal hizmet yönlendirmesi önerilir.")
 
@@ -5370,22 +7952,7 @@ elif page == D['nav'][PAGE_AI]:
 
     if "ai_chat_history" not in st.session_state or not isinstance(st.session_state.get("ai_chat_history"), list):
         st.session_state["ai_chat_history"] = []
-    if "openai_api_key" not in st.session_state:
-        st.session_state["openai_api_key"] = ""
-
-    with st.expander("AI Ayarları"):
-        runtime_key_input = st.text_input(
-            "OpenAI API Key",
-            value=st.session_state.get("openai_api_key", ""),
-            type="password",
-            placeholder="sk-...",
-            help="Boş bırakırsan önce st.secrets, sonra ortam değişkeni kullanılır.",
-        )
-        st.session_state["openai_api_key"] = (runtime_key_input or "").strip()
-        has_key = bool(_get_openai_api_key())
-        st.caption(f"API anahtar durumu: {'Hazır' if has_key else 'Tanımlı değil'}")
-        if not has_key:
-            st.warning("AI için API anahtarı tanımlı değil. Ayarlardan anahtar girin.")
+    _render_ai_key_settings(scope_key="dmd")
 
     consent_ok = bool((st.session_state.get("privacy_settings", {}) or {}).get("consent_accepted", False))
     use_context = st.checkbox("Hasta bağlamını soruya ekle", value=consent_ok)
@@ -5558,7 +8125,7 @@ elif page == D['nav'][PAGE_VISION]:
             font-style: italic;
         }
 
-        /* ✅ NEW: email style */
+        /*  NEW: email style */
         .signature-email{
             margin: 8px 0 14px 0;
             font-size: 0.92rem;
@@ -5616,7 +8183,7 @@ elif page == D['nav'][PAGE_VISION]:
     with c1:
         st.markdown("""
             <div class="vision-card">
-                <div class="vision-icon">🌍</div>
+                <div class="vision-icon"></div>
                 <h3>Global Klinik Çerçeve</h3>
                 <p>WDO ve TREAT-NMD rehberlerini tek akışta birleştirerek, ekiplerin kararlarını ülke bağımsız ve standardize biçimde destekliyoruz.</p>
             </div>
@@ -5624,7 +8191,7 @@ elif page == D['nav'][PAGE_VISION]:
     with c2:
         st.markdown("""
             <div class="vision-card">
-                <div class="vision-icon">⚡</div>
+                <div class="vision-icon"></div>
                 <h3>Anlık Müdahale Desteği</h3>
                 <p>Acil anlarda kritik riskleri sade ve görünür bir formatta sunarak zaman kaybını azaltıyor, bakım kalitesini yükseltiyoruz.</p>
             </div>
@@ -5632,7 +8199,7 @@ elif page == D['nav'][PAGE_VISION]:
     with c3:
         st.markdown("""
             <div class="vision-card">
-                <div class="vision-icon">🧬</div>
+                <div class="vision-icon"></div>
                 <h3>Kişiselleştirilmiş Gelecek</h3>
                 <p>Mutasyon temelli takip, tedavi yanıtı öngörüsü ve uzun dönem progresyon analitiği için yapay zeka odaklı altyapı geliştiriyoruz.</p>
             </div>
@@ -5649,7 +8216,7 @@ elif page == D['nav'][PAGE_VISION]:
         </div>
     """, unsafe_allow_html=True)
 
-    # ✅ NEW: Role-based visibility for founder/signature panel
+    #  NEW: Role-based visibility for founder/signature panel
     role = st.session_state.get("user_role", "family")
     show_signature = role in {"admin", "doctor"}
 
@@ -5699,7 +8266,7 @@ st.markdown("""
 }
 </style>
 <div class="cta-panel">
-    <h3 class="cta-title">🚀 Birlikte Daha Güçlü Bir Klinik Gelecek</h3>
+    <h3 class="cta-title"> Birlikte Daha Güçlü Bir Klinik Gelecek</h3>
     <p class="cta-sub">
         DMD Guardian Global Pro sürekli gelişen bir klinik platformdur.
         Rolünüze göre en doğru kanaldan geri bildirim ve iş birliği akışını açıyoruz.
@@ -5721,7 +8288,7 @@ if role in {"doctor", "admin"}:
             st.info("İş birliği için iletişim: berfinida@gmail.com")
     with b3:
         if st.button("Platformu Destekle"):
-            st.success("Desteğiniz için teşekkür ederiz 🙌")
+            st.success("Desteğiniz için teşekkür ederiz ")
 
 elif role == "researcher":
     b1, b2, b3 = st.columns(3)
@@ -5743,7 +8310,7 @@ else:  # family (default)
             st.success("Feedback kaydı alındı (demo). Yakında form + kayıt sistemi eklenecek.")
     with b2:
         if st.button("Platformu Destekle"):
-            st.success("Desteğiniz için teşekkür ederiz 🙌")
+            st.success("Desteğiniz için teşekkür ederiz ")
     with b3:
         st.caption("")
 
