@@ -1,97 +1,92 @@
-# NIZEN Clinical Platform (`final_v50.py`)
+# NIZEN Clinical Platform
 
-Streamlit tabanlı, çok hastalıklı (DMD + nörodejeneratif workspaceler) klinik karar-destek ve takip uygulaması.
+Streamlit tabanli klinik takip ve karar-destek uygulamasi.
+Ana uygulama dosyasi: `final_v50.py`
 
-## Kapsam
+## Ozellikler
 
-- DMD ana modülleri: dashboard, klinik hesaplayıcı, NSAA, acil durum, takvim/haklar, SSS, haberler, AI destekli soru-cevap.
-- Nöro workspace modları: ALS, Alzheimer, Parkinson, Huntington, Lewy Body Demans, FTD, SMA.
-- Rol tabanlı erişim: `family`, `doctor`, `researcher`, `admin`.
-- Yerel kalıcılık: SQLite (`data/dmd_local.db`) + JSON kuyruk/yedek dosyaları.
-- Opsiyonel bulut senkron: Google Sheets (`streamlit-gsheets`).
-- Opsiyonel AI entegrasyonu: OpenAI Responses API.
+- DMD odakli moduller: dashboard, klinik hesaplayici, NSAA, acil durum, takvim, haberler, AI destekli soru-cevap
+- Diger norodejeneratif workspace'ler: ALS, Alzheimer, Parkinson, Huntington, Lewy, FTD, SMA
+- Rol tabanli erisim: `family`, `doctor`, `researcher`, `admin`
+- Yerel kalicilik: SQLite (`data/dmd_local.db`)
+- Opsiyonel bulut senkron: Google Sheets (`users`, `profiles`)
+- Bulut kesintisinde local fallback + sync queue
 
-## Proje Yapısı
+## Proje Yapisi
 
 - Uygulama: `final_v50.py`
-- Test: `tests/test_dmd_exon_phase_map.py`
-- Veri klasörü (runtime): `data/`
+- Gereksinimler: `requirements.txt`
+- Testler: `tests/`
+- Runtime verisi: `data/`
 
-## Gereksinimler
+## Kurulum
 
-Minimum:
+1. Python 3.10+ kurun.
+2. Sanal ortam olusturun ve aktif edin.
+3. Bagimliliklari kurun:
 
-- Python 3.10+
-- `streamlit`
-- `pandas`
+```powershell
+pip install -r requirements.txt
+```
 
-Opsiyonel:
-
-- `streamlit-gsheets` (Google Sheets senkronu)
-- `bcrypt` (şifre hash için)
-- `plotly` (grafikler)
-- `reportlab` (PDF rapor)
-
-## Çalıştırma
+## Calistirma
 
 ```powershell
 streamlit run final_v50.py
 ```
 
-## Konfigürasyon
+## Konfigurasyon
 
-### 1) `st.secrets` / environment
+Uygulama ayarlari `st.secrets` veya environment variable ile verilebilir.
 
-Desteklenen ana ayarlar:
+### Kritik ayarlar
 
-- `SHEET_URL` veya env `SHEET_URL`
-- `OPENAI_API_KEY` veya env `OPENAI_API_KEY`
-- `auth_secret` veya env `AUTH_SECRET`
-- `persistent_login_via_query` veya env `DMD_PERSISTENT_LOGIN_QUERY`
-- env `DMD_PERSISTENT_LOGIN_TTL_SEC`
-- `i18n_patch_enabled` veya env `DMD_ENABLE_ST_I18N_PATCH`
-- `admin_owner_username`, `admin_owner_password_hash` (veya `admin_owner_password`)
-- env: `DMD_ADMIN_OWNER_USERNAME`, `DMD_ADMIN_OWNER_PASSWORD_HASH`, `DMD_ADMIN_OWNER_PASSWORD`
-- `user_roles` veya env `DMD_USER_ROLES_JSON`
-- `research_salt` (anonim araştırma exportu için gerekli)
-- env `DMD_DEBUG`
+- `SHEET_URL` (Google Sheet URL)
+- `OPENAI_API_KEY`
+- `auth_secret` veya `AUTH_SECRET`
+- `persistent_login_via_query` veya `DMD_PERSISTENT_LOGIN_QUERY`
+- `DMD_PERSISTENT_LOGIN_TTL_SEC`
+- `research_salt`
 
-### 2) Örnek `.streamlit/secrets.toml`
+### Ornek `.streamlit/secrets.toml`
 
 ```toml
 SHEET_URL = "https://docs.google.com/spreadsheets/d/<ID>"
 OPENAI_API_KEY = "sk-..."
-auth_secret = "<32+ byte entropy secret>"
+auth_secret = "<strong-random-secret>"
 persistent_login_via_query = true
-i18n_patch_enabled = true
 research_salt = "change-me"
 
 [user_roles]
 demo_doctor = "doctor"
-demo_research = "researcher"
+demo_researcher = "researcher"
 ```
 
-## Kimlik Doğrulama ve Güvenlik
+## Bulut Senkron Mantigi
 
-- Şifreler `bcrypt` (varsa) veya `PBKDF2-HMAC-SHA256` ile saklanır.
-- Legacy şifre formatlarından yeni hash formatına otomatik migrasyon vardır.
-- Geçici hesap kilitleme (başarısız deneme sayacı) bulunur.
-- Kalıcı giriş (query token) HMAC imzalıdır; güçlü `auth_secret` gerektirir.
+- Uygulama once local DB ile calisir.
+- Google Sheets ulasilabilirse local veriler buluta push edilir.
+- Bulut yazimi basarisiz olursa islem `sync_queue` icine alinir.
+- Baglanti geri geldiginde queue otomatik drain edilir.
+- Doktor/Admin sidebar uzerinden manuel "Verileri Buluta Gonder" tetikleyebilir.
 
-## Veri Katmanı
+## Guvenlik Notlari
 
-- Yerel DB tabloları: `users`, `profiles`, `system_kv`
-- Legacy JSON dosyalarından DB’ye tek seferlik migrasyon yapılır.
-- Bulut yazımı başarısız olursa sync queue’ya alınır ve sonra drain edilir.
+- Sifreler `bcrypt` (varsa) veya `PBKDF2-HMAC-SHA256` ile saklanir.
+- Login deneme limiti ve gecici kilitleme uygulanir.
+- Kalici login token'i HMAC imzalidir; guclu secret kullanin.
 
-## Test ve Doğrulama
+## Dogrulama
 
 ```powershell
 python -B -m py_compile final_v50.py
-python -m unittest tests/test_dmd_exon_phase_map.py -v
+python -m pyflakes final_v50.py
+python -m unittest -v
 ```
 
-## Notlar
+## Sorun Giderme
 
-- `git` bulunmayan ortamlarda uygulama yine çalışır; sürüm kontrolü için ayrıca kurulmalıdır.
-- Google Sheets için servis hesabı paylaşım izinleri ve worksheet adları (`users`, `profiles`) doğru olmalıdır.
+- `403 Forbidden`: Service account, sheet ile paylasilmamis olabilir.
+- `429`: API rate/limit asimi; bir sure sonra tekrar deneyin.
+- `users/profiles` sekme adlari birebir dogru olmali.
+- `SHEET_URL` formati: `https://docs.google.com/spreadsheets/d/<ID>`
